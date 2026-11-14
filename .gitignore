@@ -1,0 +1,36 @@
+# Данные и промежуточные чекпоинты обучения
+data/
+reports/*.npy
+
+# Локальные артефакты MLflow и временные графики
+mlflow.db
+mlflow.db-*
+mlruns/
+mlartifacts/
+/*.png
+
+# Виртуальные окружения
+venv/
+.venv/
+ENV/
+
+# Кэш Python и Jupyter
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Секреты и локальные настройки
+.env
+.env.*
+!.env.example
+
+# Служебные файлы ОС и IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
