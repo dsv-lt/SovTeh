@@ -131,20 +131,24 @@
 
 ## 7. Верификация качества и результаты автотестов (`pytest` + `pytest-cov` + `ruff`)
 
-Разработан полный тестовый пакет из **22 тестовых сценариев** (+ 7 параметризованных подтестов) в четырёх модулях, включая живой сквозной E2E-тест с внешним LLM API:
+Разработан полный тестовый пакет из **38 тестовых сценариев** в **7 модулях** (`test_preprocessing.py`, `test_config_and_llm.py`, `test_classifiers.py`, `test_adversarial_and_robustness.py`, `test_agents.py`, `test_mlflow.py`, `test_api_and_e2e.py`).
+
+При автономном офлайн-прогоне без живого облачного API и тяжёлой загрузки LoRA (`CLASSIFIER_BACKEND=baseline pytest tests -v --cov=src --cov-report=term-missing -k "not test_live_e2e and not test_baseline_and_lora"`) успешно проходят **36 тестов** (+ 5 подтестов) со средним покрытием **89 %** по `src/` (1 067 операторов):
 
 | Модуль исходного кода | Операторов (`Stmts`) | Пропущено (`Miss`) | Покрытие (`Cover`) |
 |---|---:|---:|---:|
 | `src/__init__.py` | 0 | 0 | **100 %** |
-| `src/app.py` | 80 | 0 | **100 %** |
-| `src/config.py` | 63 | 0 | **100 %** |
-| `src/preprocessing.py` | 61 | 0 | **100 %** |
-| `src/schemas.py` | 22 | 0 | **100 %** |
-| `src/llm_client.py` | 68 | 1 | **99 %** |
-| `src/classifier.py` | 97 | 2 | **98 %** |
-| **ИТОГО (`src/`)** | **391** | **3** | **99 %** |
+| `src/schemas.py` | 38 | 0 | **100 %** |
+| `src/config.py` | 63 | 1 | **98 %** |
+| `src/preprocessing.py` | 67 | 2 | **97 %** |
+| `src/app.py` | 115 | 6 | **95 %** |
+| `src/llm_client.py` | 123 | 11 | **91 %** |
+| `src/train_mlflow.py` | 228 | 28 | **88 %** |
+| `src/agents.py` | 328 | 43 | **87 %** |
+| `src/classifier.py` *(без ветки LoRA на baseline-прогоне)* | 105 | 28 | **73 %** |
+| **ИТОГО (`src/`)** | **1 067** | **119** | **89 %** |
 
-* Статический анализатор `ruff check src tests --line-length 100` — **0 ошибок** (полное соответствие стандартам PEP8).
+* Статический анализатор `ruff check src tests agents_comparison.py --line-length 105` — **0 ошибок** (`All checks passed!`).
 * В ходе модульного тестирования выявлен и устранён дефект обработки невидимых символов нулевой ширины (`\u200b`, `\ufeff`) в `clean_text()`, которые ранее заменялись на видимый пробел вместо удаления.
 
 ---

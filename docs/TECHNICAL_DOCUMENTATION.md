@@ -1,7 +1,7 @@
 ﻿# Техническая документация проекта Literary Style Assistant
 
-**Версия:** 1.0.0  
-**Стек технологий:** Python 3.11, PyTorch 2.11 (CUDA 12.8 / CPU), Hugging Face Transformers & PEFT (LoRA), Scikit-Learn, FastAPI, Pydantic v2, HTTPX, Docker
+**Версия:** 1.1.0  
+**Стек технологий:** Python 3.11 / 3.12, PyTorch (CUDA 12.8 / CPU), Hugging Face Transformers & PEFT (LoRA), Scikit-Learn, FastAPI, Pydantic v2, HTTPX, MLflow (`sqlite:///mlflow.db` + Model Registry + Tracing), LangChain & LangGraph, Ruff, Pytest, Docker
 
 ---
 
@@ -13,19 +13,23 @@
 4. [Подсистема локальной классификации стиля (`src/classifier.py`)](#4-подсистема-локальной-классификации-стиля-srcclassifierpy)
 5. [Клиент внешних LLM-провайдеров (`src/llm_client.py`)](#5-клиент-внешних-llm-провайдеров-srcllm_clientpy)
 6. [Спецификация REST API и контрактов данных (`src/app.py`, `src/schemas.py`)](#6-спецификация-rest-api-и-контрактов-данных-srcapppy-srcschemaspy)
-7. [Справочник конфигурации и безопасность (`src/config.py`)](#7-справочник-конфигурации-и-безопасность-srcconfigpy)
-8. [Артефакты моделей и воспроизводимость обучения (`models/`, `notebooks/`)](#8-артефакты-моделей-и-воспроизводимость-обучения-models-notebooks)
-9. [Контейнеризация, развёртывание и эксплуатация](#9-контейнеризация-развёртывание-и-эксплуатация)
-10. [Система тестирования и контроля качества (`tests/`)](#10-система-тестирования-и-контроля-качества-tests)
+7. [MLOps-конвейер, Model Registry и CI (`src/train_mlflow.py`, `.github/workflows/ci.yml`)](#7-mlops-конвейер-model-registry-и-ci-srctrain_mlflowpy-githubworkflowsciyml)
+8. [ИИ-агенты с инструментами и MLflow Tracing (`src/agents.py`, `agents_comparison.py`)](#8-ии-агенты-с-инструментами-и-mlflow-tracing-srcagentspy-agents_comparisonpy)
+9. [Справочник конфигурации и безопасность (`src/config.py`)](#9-справочник-конфигурации-и-безопасность-srcconfigpy)
+10. [Артефакты моделей и воспроизводимость обучения (`models/`, `notebooks/`)](#10-артефакты-моделей-и-воспроизводимость-обучения-models-notebooks)
+11. [Контейнеризация, развёртывание и эксплуатация](#11-контейнеризация-развёртывание-и-эксплуатация)
+12. [Система тестирования и контроля качества (`tests/`)](#12-система-тестирования-и-контроля-качества-tests)
 
 ---
 
 ## 1. Назначение и обзор системы
 
-**Literary Style Assistant** — двухстадийный микросервис интеллектуальной обработки русскоязычного текста, решающий две связанные задачи в едином конвейере:
+**Literary Style Assistant** — интеллектуальный микросервис анализа и стилизации русскоязычной художественной прозы, объединяющий четыре подсистемы:
 
-1. **Атрибуция литературного стиля (Стадия 1, локальный ИИ):** определение наиболее близкого классика русской литературы по полному набору из **64 авторов** корпуса `ViliamVolosV/russian_classic_literature` без сокращения числа классов. Вычисление выполняется локально (на GPU или CPU) с возвратом предсказанного автора и калиброванной оценки уверенности (`confidence`).
-2. **Управляемая стилизация (Стадия 2, внешний LLM API):** динамическая сборка системного промпта под найденного автора и асинхронный вызов внешнего генеративного API (**Google AI Studio / Gemini**, **Groq Cloud** или **OpenRouter**) для продолжения текста или ответа на запрос пользователя с сохранением лексики, синтаксиса, ритмики и пунктуации автора.
+1. **Атрибуция литературного стиля (Стадия 1, локальный ИИ):** определение наиболее близкого классика русской литературы по полному набору из **64 авторов** корпуса `ViliamVolosV/russian_classic_literature` без сокращения классов. Вычисление выполняется локально (GPU или CPU) с возвратом предсказанного автора и калиброванной вероятности (`confidence`).
+2. **Управляемая стилизация (Стадия 2, внешний LLM API):** динамическая сборка системного промпта под найденного автора и асинхронный вызов OpenAI-совместимого API (**Google AI Studio / Gemini**, **Groq Cloud** или **OpenRouter**) с защитой от prompt-инъекций, ретраями и fallback-моделями.
+3. **MLOps-конвейер и CI/CD (`src/train_mlflow.py`, `.github/workflows/ci.yml`):** перебор гиперпараметров PyTorch-классификатора с записью запусков, графиков, JSON-конфигов и весов в **MLflow (`sqlite:///mlflow.db`)**, автоматической регистрацией лучшей модели в **MLflow Model Registry** (стадия `Staging`), а также автоматической проверкой `ruff` и `pytest` в GitHub Actions.
+4. **Автономные ИИ-агенты (`src/agents.py`, `agents_comparison.py`, `POST /agent`):** выполнение многошаговых составных запросов тремя архитектурами (**Native Tool Calling**, **JSON-цикл**, **LangGraph ReAct**) с тремя доменными инструментами (`classify_style`, `author_metrics`, `calc`), Pydantic-валидацией аргументов и трассировкой шагов в консоль и MLflow Tracing.
 
 ---
 
@@ -35,16 +39,21 @@
 
 ```mermaid
 flowchart LR
-    Client["HTTP-клиент (curl / UI / SDK)"]
+    Client["HTTP / CLI клиент"]
     subgraph Service["FastAPI Микросервис (src/app.py)"]
-        Router["Валидация и маршрутизация\n(/health, /classify, /ask)"]
+        Router["Маршрутизация и валидация\n(/, /health, /classify, /ask, /agent)"]
         Preproc["Предобработка и чанкинг\n(src/preprocessing.py)"]
         subgraph Stage1["Стадия 1: StyleClassifier (src/classifier.py)"]
             LoRA["LoraClassifier\nruBERT-base + LoRA (merged)"]
             Base["BaselineClassifier\nChar TF-IDF + PyTorch MLP"]
         end
         Prompt["Генератор промпта\nbuild_system_prompt()"]
+        Agents["ИИ-агенты и run_tool\n(src/agents.py: native | json | framework)"]
         LLMClient["Асинхронный клиент + Retry/Fallback\n(src/llm_client.py)"]
+    end
+    subgraph LocalData["Локальные артефакты и MLOps"]
+        Reports["reports/ + models/"]
+        MLflow["MLflow SQLite + Model Registry\n(src/train_mlflow.py -> mlflow.db)"]
     end
     subgraph Providers["Внешние OpenAI-совместимые LLM API"]
         AIStudio["Google AI Studio\ngemini-3.1-flash-lite"]
@@ -55,11 +64,16 @@ flowchart LR
     Client --> Router
     Router --> Preproc
     Preproc --> Stage1
+    Router --> Agents
+    Agents --> Stage1
+    Agents --> Reports
     Stage1 --> Prompt
     Prompt --> LLMClient
+    Agents --> LLMClient
     LLMClient --> AIStudio
     LLMClient --> Groq
     LLMClient --> OR
+    MLflow --> Reports
 ```
 
 ### 2.2. Последовательность обработки запроса `POST /ask`
@@ -74,7 +88,7 @@ sequenceDiagram
     participant Ext as Внешний LLM API
 
     User->>API: POST /ask {"question": "...", "k": 3, "temperature": 0.7}
-    API->>API: Проверка схемы Pydantic и непустоты строки (иначе 400 / 422)
+    API->>API: Проверка Pydantic и нормализация (иначе 400 / 422)
     API->>Clf: asyncio.to_thread(classifier.predict, cleaned, k)
     Clf->>Clf: chunk_text() -> _logits() -> softmax().mean(dim=0)
     Clf-->>API: Prediction(author, confidence, top_k)
@@ -93,25 +107,23 @@ sequenceDiagram
 
 ### 2.3. Управление жизненным циклом (`lifespan`)
 
-Контекстный менеджер `lifespan(app: FastAPI)` в `src/app.py` гарантирует отсутствие повторного чтения весов на запросах и корректную выгрузку ресурсов:
-* **На старте:** загружает конфигурацию `Settings`, десериализует `models/tfidf_vectorizer.pkl` в `app.state.vectorizer`, инициализирует выбранный классификатор (`LoraClassifier` либо `BaselineClassifier`) в `app.state.classifier` и открывает пул соединений `httpx.AsyncClient` в `app.state.llm_client`.
-* **При остановке:** закрывает HTTP-соединения (`await llm_client.aclose()`), очищает ссылки на веса (`classifier.close()`), вызывает сборщик мусора `gc.collect()` и освобождает кэш видеопамяти `torch.cuda.empty_cache()`.
+Контекстный менеджер `lifespan(app: FastAPI)` в `src/app.py` гарантирует единоразовую загрузку моделей и чистое освобождение ресурсов:
+* **На старте:** читает `get_settings()`, десериализует `models/tfidf_vectorizer.pkl` в `app.state.vectorizer`, загружает классификатор (`LoraClassifier` либо `BaselineClassifier`) в `app.state.classifier`, регистрирует его для инструмента `classify_style` через `set_agent_classifier(classifier)` и открывает пул соединений `httpx.AsyncClient` внутри `LLMClient`.
+* **При остановке:** закрывает HTTP-соединения (`await llm_client.aclose()`), освобождает веса (`classifier.close()`), сбрасывает `set_agent_classifier(None)`, запускает `gc.collect()` и `torch.cuda.empty_cache()`.
 
 ---
 
 ## 3. Модуль предобработки данных (`src/preprocessing.py`)
 
-Модуль используется совместно исследовательскими ноутбуками (`notebooks/`) и продакшен-сервисом (`src/`), чем исключается расхождение признаков между обучением и инференсом (*train-serving skew*).
-
-### Ключевые функции
+Модуль используется совместно исследовательскими ноутбуками (`notebooks/`) и продакшен-сервисом (`src/`), исключая расхождение признаков между обучением и инференсом (*train-serving skew*).
 
 | Функция | Сигнатура | Описание |
 |---|---|---|
-| `extract_author` | `(user_message: str) -> str \| None` | Извлекает имя автора основным регулярным выражением `r"стиле автора ([^\"]+)"` либо резервным `r"автора\s+([^\"]+?)\s*$"`, покрывая все 4 шаблона реплик датасета (100 % из 8 018 записей `train`). |
-| `clean_text` | `(text: str) -> str` | Декодирует буквальные экранирования (`\\r\\n`, `\\n`, `\\t`, `\\"`, `\\'`), нормализует переводы строк к `\n`, удаляет управляющие ASCII-символы `[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]`, схлопывает неразрывные/тонкие пробелы (`\u00a0`, `\u2009`, `\u200b`, `\ufeff`) и удаляет пустые строки. |
-| `normalize_for_model` | `(text: str) -> str` | Применяет `clean_text` и схлопывает все пробельные последовательности `\s+` в одиночный пробел, устраняя зависимость от книжной вёрстки переносов строк. |
-| `chunk_text` | `(text: str, chunk_chars: int = 1000, min_chars: int = 200) -> list[str]` | Разбивает нормализованный текст по границам слов на блоки длиной ~`chunk_chars`. Если последний блок короче `min_chars` и в списке уже есть блоки, он присоединяется к предыдущему, предотвращая шумные сверхкороткие «хвосты». |
-| `iter_jsonl` | `(path: str \| Path) -> Iterable[dict]` | Потоковое чтение JSON Lines файлов в кодировке UTF-8. |
+| `extract_author` | `(user_message: str) -> str \| None` | Извлекает имя автора выражениями `AUTHOR_RE_PRIMARY = r"стиле автора ([^\"\r\n]+)"` и `AUTHOR_RE_FALLBACK = r"автора\s+([^\"\r\n]+?)\s*$"`, покрывая 100% из 8 018 записей `train` и блокируя многострочные инъекции (`\r\n`). |
+| `clean_text` | `(text: str) -> str` | Декодирует буквальные экранирования (`\r\n`, `\n`, `\t`, `\"`, `\'`), нормализует переносы строк, удаляет управляющие ASCII-символы `[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b\ufeff]`, схлопывает горизонтальные/неразрывные пробелы и пустые строки. |
+| `normalize_for_model` | `(text: str) -> str` | Вызывает `clean_text` и схлопывает все пробельные последовательности `\s+` в одиночный пробел. |
+| `chunk_text` | `(text: str, chunk_chars: int = 1000, min_chars: int = 200) -> list[str]` | Нарезает текст по границам слов на фрагменты ~`chunk_chars`. Монолитные токены без пробелов разрезаются по `chunk_chars` (защита от DoS), короткий хвост `< min_chars` при наличии предыдущих блоков склеивается с последним фрагментом. |
+| `iter_jsonl` | `(path: str \| Path) -> Iterable[dict]` | Потоковое чтение JSON Lines файлов в UTF-8. |
 | `parse_record` | `(record: dict) -> tuple[str \| None, str]` | Извлекает пару `(author, assistant_text)` из диалоговой структуры `{"messages": [...]}`. |
 
 ---
@@ -120,26 +132,21 @@ sequenceDiagram
 
 ### 4.1. Базовый абстрактный класс `StyleClassifier`
 
-* Вычисление защищено мьютексом `threading.Lock()` и контекстом `torch.inference_mode()` для безопасного параллельного вызова из пула потоков `asyncio.to_thread`.
-* Для входного текста формируется до `settings.max_chunks` (по умолчанию `16`) фрагментов. Для каждого фрагмента $m \in \{1, \dots, M\}$ модель выдаёт вектор сырых логитов $z_m \in \mathbb{R}^{C}$ ($C = 64$), после чего итоговое распределение вероятностей вычисляется усреднением:
-  $$\bar{p} = \frac{1}{M} \sum_{m=1}^{M} \operatorname{softmax}(z_m)$$
-* Предсказанный класс $\hat{y} = \arg\max_c \bar{p}_c$, уверенность $\text{confidence} = \bar{p}_{\hat{y}}$.
+* Вычисление защищено мьютексом `threading.Lock()` и контекстом `torch.inference_mode()` для безопасного параллельного вызова через `asyncio.to_thread`.
+* Для входного текста формируется до `settings.max_chunks` (по умолчанию `16`) фрагментов. Модель выдаёт матрицу сырых логитов $z_m \in \mathbb{R}^{64}$, а итоговые вероятности получаются усреднением `softmax`:
+  $$\bar{p} = \frac{1}{M} \sum_{m=1}^{M} \operatorname{softmax}(z_m), \quad \hat{y} = \arg\max_c \bar{p}_c$$
 
 ### 4.2. Бэкенд `baseline`: `BaselineClassifier` и `TextClassifier`
 
-* **Векторизация:** `TfidfVectorizer(analyzer="char", lowercase=True, ngram_range=(2, 4), max_features=50000, sublinear_tf=True, dtype=np.float32)` без морфологической лемматизации.
-* **Нейросетевая архитектура (`TextClassifier`):**
-  * `nn.Linear(50000, 128)` -> `nn.ReLU()` -> `nn.Linear(128, 64)`.
-  * Выходной слой возвращает **строго сырые логиты** (без `Softmax`/`LogSoftmax`), совместимые с `nn.CrossEntropyLoss` при обучении.
-* **Формат чекпоинта `models/baseline_pytorch.pt`:** словарь с ключами `model_state_dict`, `optim_state_dict`, `epoch` (`20`), `in_features` (`50000`), `num_classes` (`64`), `classes` (`list[str]`), загружаемый безопасно с флагом `weights_only=True`.
+* **Векторизация:** `TfidfVectorizer(analyzer="char", lowercase=True, ngram_range=(2, 4), max_features=50000, sublinear_tf=True, dtype=np.float32)` без лемматизации.
+* **Архитектура `TextClassifier`:** `nn.Linear(50000, 128) -> nn.ReLU() -> nn.Linear(128, 64)`. Выход возвращает **строго сырые логиты** (без `Softmax`/`LogSoftmax`).
+* **Формат чекпоинта `models/baseline_pytorch.pt`:** `model_state_dict`, `optim_state_dict`, `epoch` (`20`), `in_features` (`50000`), `num_classes` (`64`), `classes` (`list[str]`), загружается с `weights_only=True`.
 
 ### 4.3. Бэкенд `lora`: `LoraClassifier`
 
-* **Базовый энкодер:** `ai-forever/ruBert-base` (`12` слоёв трансформера, `hidden_size=768`, `180.8M` параметров с классификационной головой).
-* **Параметро-эффективная адаптация LoRA:** для целевых линейных проекций `query`, `value` и `dense` веса модифицируются низкоранговой добавкой ранга $r = 16$ с масштабом $\alpha = 32$:
-  $$W' = W_0 + \frac{\alpha}{r} B A, \quad A \in \mathbb{R}^{r \times d_{\text{in}}},\; B \in \mathbb{R}^{d_{\text{out}} \times r}$$
-* **Оптимизация инференса:** при старте сервиса вызывается `PeftModel.from_pretrained(base, lora_dir).merge_and_unload()`, вливающая матрицы $\frac{\alpha}{r} B A$ непосредственно в базовые тензоры $W_0$. На GPU RTX (архитектура Ampere/Ada/Blackwell) прямой проход выполняется под `torch.autocast("cuda", dtype=torch.bfloat16)`.
-* **Автоматический откат:** функция-фабрика `load_classifier()` при отсутствии каталога `models/lora_classifier` логирует предупреждение и прозрачно переключается на `BaselineClassifier`.
+* **Базовый энкодер:** `ai-forever/ruBert-base` (`12` слоёв, `hidden_size=768`, `180 789 632` параметров с головой классификации).
+* **Адаптер LoRA:** ранг $r = 16$, масштаб $\alpha = 32$, целевые проекции `query`, `value`, `dense`; на старте вызывается `.merge_and_unload()`, вливающая $\frac{\alpha}{r} B A$ в основные матрицы $W_0$ с нулевым оверхедом на инференсе. На CUDA используется `torch.autocast("cuda", dtype=torch.bfloat16)`.
+* **Автоматический откат:** `load_classifier()` при отсутствии `models/lora_classifier/adapter_config.json` логирует предупреждение и переключается на `BaselineClassifier`.
 
 ---
 
@@ -147,7 +154,7 @@ sequenceDiagram
 
 ### 5.1. Поддерживаемые провайдеры и автоопределение
 
-При `LLM_PROVIDER=auto` (значение по умолчанию) провайдер определяется автоматически по префиксу `LLM_API_KEY`:
+При `LLM_PROVIDER=auto` провайдер выбирается автоматически по префиксу `LLM_API_KEY`:
 
 | Провайдер | Префикс ключа | Базовый URL (`resolved_base_url`) | Основная модель | Резервные модели (`fallback_models`) |
 |---|---|---|---|---|
@@ -155,183 +162,202 @@ sequenceDiagram
 | **Groq Cloud** (`groq`) | `gsk_` *(и прочие)* | `https://api.groq.com/openai/v1` | `llama-3.1-8b-instant` | — |
 | **OpenRouter** (`openrouter`) | `sk-or-` | `https://openrouter.ai/api/v1` | `meta-llama/llama-3.3-70b-instruct:free` | — |
 
-### 5.2. Системный промпт стилизации
+### 5.2. Методы `chat()`, `generate()` и разбор `tool_calls`
 
-Функция `build_system_prompt(predicted_author)` формирует контекстную инструкцию:
-> *«Ты — стилизатор русской классической литературы. Входной текст идентифицирован как стиль автора: {predicted_author}. Ответь на запрос пользователя или продолжи повествование, строго воспроизводя лексику, синтаксис, пунктуационные особенности и образы автора {predicted_author}.»*
+* `async def chat(messages, tools=None, temperature=0.0) -> LLMChatResult` — универсальный метод для Стадии 2 и агентных циклов: отправляет OpenAI-совместимый `POST /chat/completions` (опционально со схемами `tools`), проверяет `finish_reason` (`"SAFETY"`, `"content_filter"` → `LLMError(502)`), извлекает текст `content` и структурированные `ToolCall(id, name, arguments)` через `_parse_tool_calls()`.
+* `async def generate(system_prompt, user_message, temperature=0.7) -> str` — обёртка над `chat()` для Стадии 2, изолирующая пользовательский ввод в тройных кавычках; `SYSTEM_PROMPT_TEMPLATE` дополнительно содержит правила игнорирования prompt-инъекций.
 
 ### 5.3. Обработка отказов и ретраи
 
-* На временных сбоях (`HTTP 429, 500, 502, 503, 504`, `httpx.TimeoutException`, сетевые ошибки транспорта) клиент выполняет повторные попытки с экспоненциальной задержкой (`1s`, `2s`, ...) и переключением на следующую модель из `candidate_models`.
-* На ошибках авторизации (`HTTP 401, 403`) клиент завершает вызов немедленно без повторных запросов (`LLMError`, статус `502`).
-* Если `LLM_API_KEY` не задан или пуст, выбрасывается `LLMError` со статусом `503 Service Unavailable`.
+* Временные ошибки (`HTTP 429, 500, 502, 503, 504`, `httpx.TimeoutException`, сетевые сбои) повторяются с задержкой `1.0 * 2**attempt` и переключением на резервные модели `candidate_models`.
+* Ошибки модели `HTTP 400 / 404` при наличии запасных моделей в цепочке немедленно переключают на следующую модель.
+* Ошибки авторизации (`HTTP 401 / 403`) завершаются без ретраев (`LLMError`, `502`); отсутствие ключа даёт `LLMError(503)`.
 
 ---
 
 ## 6. Спецификация REST API и контрактов данных (`src/app.py`, `src/schemas.py`)
 
+Все ответы сериализуются через `UTF8JSONResponse` (`Content-Type: application/json; charset=utf-8`), а `GET /` перенаправляет на `/docs`.
+
 ### 6.1. `GET /health`
-
-Проверка жизнеспособности контейнера и готовности локальной модели.
-
-* **Ответ `200 OK` (`HealthResponse`):**
-  ```json
-  {
-    "status": "ok",
-    "model_loaded": true
-  }
-  ```
+Проверка состояния сервиса (`HealthResponse`): `{"status": "ok", "model_loaded": true}`.
 
 ### 6.2. `POST /classify`
+Локальная классификация стиля автора (без внешнего `LLM_API_KEY`).
+* **Вход (`QueryRequest`):** `question` (`1..15000`), `k` (`1..10`, по умолчанию `3`), `temperature` (`0.0..2.0`, по умолчанию `0.7`).
+* **Ответ `200 OK` (`ClassifyResponse`):** `predicted_author`, `confidence`, `model_name`, `top_authors: list[AuthorScore]`.
 
-Локальная классификация стиля автора (Стадия 1) с выдачей распределения `top-k` авторов. Не требует наличия внешнего ключа `LLM_API_KEY`.
+### 6.3. `POST /ask`
+Полный двухстадийный конвейер: локальная классификация + стилизованная генерация.
+* **Вход (`QueryRequest`):** `question`, `k`, `temperature`.
+* **Ответ `200 OK` (`QueryResponse`):** `predicted_author`, `confidence`, `model_name`, `generated_text`.
 
-* **Тело запроса (`QueryRequest`):**
-  * `question` (`str`, обязательное, длина `1..15000` знаков, непустая строка после нормализации) — литературный фрагмент или запрос;
-  * `k` (`int`, по умолчанию `3`, диапазон `1..10`) — размер списка наиболее вероятных авторов;
-  * `temperature` (`float`, по умолчанию `0.7`, диапазон `0.0..2.0`) — не влияет на `/classify`, сохранено для единого контракта запроса.
-* **Ответ `200 OK` (`ClassifyResponse`):**
+### 6.4. `POST /agent`
+Выполнение многошагового ИИ-агента с инструментами `classify_style`, `author_metrics`, `calc`.
+
+* **Тело запроса (`AgentRequest`):**
   ```json
   {
-    "predicted_author": "Достоевский Ф",
-    "confidence": 0.9412,
-    "model_name": "rubert-base-lora",
-    "top_authors": [
-      {"author": "Достоевский Ф", "probability": 0.9412},
-      {"author": "Андреев Л", "probability": 0.0215},
-      {"author": "Гоголь Н", "probability": 0.0108}
+    "question": "Узнай F1-score Чехова А и Достоевского Ф и вычисли разницу",
+    "approach": "native",
+    "max_iterations": 6,
+    "temperature": 0.0
+  }
+  ```
+  Поля: `question` (`1..15000`), `approach` (`"native" | "json" | "framework"`, по умолчанию `"native"`), `max_iterations` (`1..12`, по умолчанию `6`), `temperature` (`0.0..2.0`, по умолчанию `0.0`).
+* **Ответ `200 OK` (`AgentResponse`):**
+  ```json
+  {
+    "approach": "native",
+    "answer": "F1-score Достоевского Ф — 0.9394, Чехова А — 0.8934, разница — 0.046.",
+    "iterations": 3,
+    "steps": [
+      {"step": 1, "tool": "author_metrics", "args": {"author_query": "Чехов А"}, "result": "...", "raw": null},
+      {"step": 1, "tool": "author_metrics", "args": {"author_query": "Достоевский Ф"}, "result": "...", "raw": null},
+      {"step": 2, "tool": "calc", "args": {"expression": "0.9394 - 0.8934"}, "result": "0.046", "raw": null}
     ]
   }
   ```
-
-### 6.3. `POST /ask`
-
-Полный двухстадийный конвейер: классификация стиля + генерация стилизованного ответа внешней LLM.
-
-* **Тело запроса:** `QueryRequest` (`question`, `k`, `temperature`).
-* **Ответ `200 OK` (`QueryResponse`):**
-  ```json
-  {
-    "predicted_author": "Лажечников И",
-    "confidence": 0.7169,
-    "model_name": "rubert-base-lora",
-    "generated_text": "Младое сердце радостно замирает в груди..."
-  }
-  ```
-
-### 6.4. `POST /agent`
-
-Многошаговый ИИ-агент с вызовами доменных инструментов (`classify_style`, `author_metrics`, `calc`).
-
-* **Тело запроса (`AgentRequest`):** `question` (`1..15000`), `approach` (`native|json|framework`), `max_iterations` (`1..12`), `temperature` (`0.0..2.0`).
-* **Ответ `200 OK` (`AgentResponse`):** `approach`, `answer`, `iterations`, `steps` (список `AgentStepTrace`).
 
 ### 6.5. Коды ошибок API
 
 | HTTP-код | Причина возникновения | Тело ответа |
 |---|---|---|
-| `400 Bad Request` | Поле `question` равно `""` или состоит только из пробельных символов (`"   "`, `"\t\n"`) | `{"detail": "Пустой вопрос"}` |
-| `422 Unprocessable Entity` | Отсутствует обязательное поле `question` либо нарушены границы `k` (`1..10`) / `temperature` (`0.0..2.0`) | Стандартный список ошибок Pydantic |
-| `502 Bad Gateway` | Ошибка авторизации (`401/403`), некорректный ответ или исчерпание ретраев внешнего LLM API | `{"detail": "Ошибка внешнего LLM API: ..."}` |
-| `503 Service Unavailable` | Не задан `LLM_API_KEY` либо не загружена локальная модель классификатора | `{"detail": "LLM_API_KEY не задан..."}` |
-| `504 Gateway Timeout` | Превышен тайм-аут `LLM_TIMEOUT` на всех попытках обращения к внешней LLM | `{"detail": "Ошибка внешнего LLM API: тайм-аут..."}` |
+| `400 Bad Request` | `question == ""` или состоит из пробелов/управляющих символов | `{"detail": "Пустой вопрос"}` |
+| `422 Unprocessable Entity` | Нарушение ограничений Pydantic (`question`, `k`, `temperature`, `approach`, `max_iterations`) | Список ошибок Pydantic |
+| `502 Bad Gateway` | Ошибка авторизации `401/403`, safety-блокировка или исчерпание ретраев LLM API | `{"detail": "Ошибка внешнего LLM API: ..."}` |
+| `503 Service Unavailable` | Не задан `LLM_API_KEY` (для `/ask` или `/agent`) либо не загружен локальный классификатор | `{"detail": "..."}` |
+| `504 Gateway Timeout` | Тайм-аут `LLM_TIMEOUT` на всех попытках обращения к LLM API | `{"detail": "Ошибка внешнего LLM API: тайм-аут..."}` |
 
 ---
 
-## 7. Справочник конфигурации и безопасность (`src/config.py`)
+## 7. MLOps-конвейер, Model Registry и CI (`src/train_mlflow.py`, `.github/workflows/ci.yml`)
 
-Все параметры управляются через класс `Settings(BaseSettings)` и считываются из переменных окружения ОС или локального файла `.env`:
+### 7.1. Эксперименты и реестр моделей MLflow (`src/train_mlflow.py`)
+
+* **Хранилище и эксперимент:** локальная БД `sqlite:///mlflow.db`, эксперимент `doc-classifier`, фиксированный seed `42`.
+* **Источник данных (`load_training_split`):** читает `data/processed/chunks_train.parquet` с разбиением по группам произведений `GroupShuffleSplit(test_size=0.2)` (чтобы фрагменты одной книги не пересекались между train и test); при отсутствии `chunks_train.parquet` или флаге `--synthetic` строит детерминированный разреженный датасет той же размерности `50 000` признаков (`data_source="synthetic_fallback"`).
+* **Сетки гиперпараметров:**
+  * полная (`DEFAULT_GRID`, 9 запусков): `lr ∈ {0.0001, 0.001, 0.01}` × `epochs ∈ {5, 10, 20}`;
+  * быстрая (`QUICK_GRID`, `--quick`, 4 запуска): `(0.0001, 5), (0.0005, 5), (0.001, 5), (0.01, 5)`.
+* **Логирование в `train_once()`:**
+  * **Параметры:** `lr`, `epochs`, `batch_size`, `in_features`, `num_classes`, `optimizer="Adam"`.
+  * **Теги:** `assignment="mlops-task-1"`, `model_family="TextClassifier_MLP"`, `data_source`.
+  * **Метрики:** `train_loss` (по шагам эпох), `test_accuracy`, `test_f1_macro`, `train_time_sec`.
+  * **Артефакты:** `config/run_config.json`, сравнительный график метрик `charts/accuracy_chart.png` и модель PyTorch через `mlflow.pytorch.log_model` с сигнатурой `infer_signature` и примером входа `input_example`.
+* **Model Registry (`register_best_model_to_staging`):** выбирает лучший запуск по `(test_accuracy, test_f1_macro)`, регистрирует модель под именем **`literary-style-classifier`**, назначает алиас `@staging`, тег `stage="Staging"` и выполняет перевод стадии в **`Staging`**.
+
+### 7.2. Непрерывная интеграция (`.github/workflows/ci.yml`)
+
+При каждом `push` и `pull_request` в ветку `main` запускается job `lint-and-test` на `ubuntu-latest` с Python `3.12`:
+1. Установка CPU-сборки PyTorch и `requirements.txt`.
+2. Статический анализ: `ruff check src tests agents_comparison.py --line-length 105`.
+3. Автономный прогон тестов: `CLASSIFIER_BACKEND=baseline pytest tests -v -k "not test_live_e2e and not test_baseline_and_lora"`.
+
+---
+
+## 8. ИИ-агенты с инструментами и MLflow Tracing (`src/agents.py`, `agents_comparison.py`)
+
+### 8.1. Инструменты и безопасность вызова
+
+Все 3 инструмента зарегистрированы в `TOOLS` и описаны строгими Pydantic-схемами с `ConfigDict(extra="forbid")`:
+
+| Инструмент | Схема аргументов | Назначение |
+|---|---|---|
+| `classify_style` | `ClassifyStyleArgs(text: str)` | Вызывает локальный `StyleClassifier.predict(text, k=3)` и возвращает JSON с `predicted_author`, `confidence`, `model_name`, `top_3`. |
+| `author_metrics` | `AuthorMetricsArgs(author_query: str)` | Читает `reports/lora_per_class_report.csv`, `metrics_lora.json`, `metrics_baseline.json` и `labels.json`; возвращает метрики автора или сводку `'overall'`. |
+| `calc` | `CalcArgs(expression: str)` | Безопасный AST-вычислитель (без `eval`): поддерживает только числа и бинарные/унарные `+`, `-`, `*`, `/`, скобки, перехватывает деление на ноль. |
+
+Обёртка `run_tool(name, args)` проверяет существование инструмента, валидирует входные аргументы через Pydantic и перехватывает любые ошибки, возвращая агенту диагностическую строку вместо падения цикла.
+
+### 8.2. Три архитектуры агентных циклов и наблюдаемость
+
+1. **Native Tool Calling (`run_native_agent[_async]`):** передаёт автогенерированные OpenAI JSON-схемы `TOOL_SCHEMAS` в `LLMClient.chat(..., tools=TOOL_SCHEMAS)`, сохраняет сообщения `assistant` с `tool_calls` и возвращает ответы инструментов в сообщениях `role="tool"` с `tool_call_id`.
+2. **Ручной JSON-цикл (`run_json_agent[_async]`):** работает с любыми моделями через `JSON_SYSTEM_PROMPT`; парсер `extract_json()` очищает markdown-блоки и извлекает первый JSON через `JSONDecoder.raw_decode()`. Ошибки парсинга или неизвестные действия передаются в историю для самоисправления.
+3. **Фреймворк LangGraph (`run_framework_agent[_async]`):** строит граф через `langgraph.prebuilt.create_react_agent` с `ChatOpenAI`, инструментами `@tool` и защитным лимитом `recursion_limit = max_iterations * 2 + 2` (перехват `GraphRecursionError`).
+
+**Трассировка:** все циклы поддерживают логирование шагов в `logger`/`AgentStepTrace` и опциональный **MLflow Tracing** (`enable_mlflow_trace=True`, эксперимент `doc-classifier-agents`): корневые спаны `AGENT`, дочерние спаны `LLM` и `TOOL` (`_execute_traced_tool`), а для LangGraph — `mlflow.langchain.autolog()`. Скрипт `agents_comparison.py` сравнивает все три подхода на одном составном запросе (как с реальным LLM API, так и с флагами `--mock --trace`).
+
+---
+
+## 9. Справочник конфигурации и безопасность (`src/config.py`)
 
 | Переменная | Тип | По умолчанию | Описание |
 |---|---|---|---|
-| `LLM_API_KEY` | `SecretStr \| None` | `None` | API-ключ к Google AI Studio, Groq Cloud или OpenRouter |
-| `LLM_PROVIDER` | `auto\|groq\|openrouter\|aistudio` | `auto` | Явный выбор провайдера либо автоопределение по префиксу ключа |
-| `LLM_BASE_URL` | `str \| None` | `None` | Переопределение базового URL OpenAI-совместимого API |
-| `LLM_MODEL` | `str \| None` | `None` | Принудительное имя внешней LLM-модели |
-| `LLM_TIMEOUT` | `float` | `25.0` | Тайм-аут одного HTTP-запроса к внешнему API в секундах |
-| `LLM_MAX_TOKENS` | `int` | `1024` | Максимальное число генерируемых токенов (`16..8192`) |
-| `LLM_MAX_RETRIES` | `int` | `2` | Число дополнительных попыток при временной ошибке LLM API (`0..5`) |
-| `CLASSIFIER_BACKEND` | `lora\|baseline` | `lora` | Выбор локальной модели классификации стиля |
-| `MODELS_DIR` | `Path` | `<root>/models` | Путь к директории с весами и векторизатором |
-| `DEVICE` | `auto\|cpu\|cuda` | `auto` | Устройство вычислений PyTorch (`auto` выбирает `cuda` при наличии) |
-| `CHUNK_CHARS` | `int` | `1000` | Целевая длина текстового фрагмента в символах |
-| `MAX_CHUNKS` | `int` | `16` | Верхний предел числа фрагментов на один входной запрос |
+| `LLM_API_KEY` | `SecretStr \| None` | `None` | Ключ Google AI Studio, Groq Cloud или OpenRouter |
+| `LLM_PROVIDER` | `auto\|groq\|openrouter\|aistudio` | `auto` | Явный провайдер или автоопределение по префиксу |
+| `LLM_BASE_URL` / `LLM_MODEL` | `str \| None` | `None` | Переопределение URL API и имени модели |
+| `LLM_TIMEOUT` | `float` | `25.0` | Тайм-аут одного HTTP-запроса (сек) |
+| `LLM_MAX_TOKENS` | `int` | `1024` | Лимит токенов генерации (`16..8192`) |
+| `LLM_MAX_RETRIES` | `int` | `2` | Число ретраев при временных сбоях (`0..5`) |
+| `CLASSIFIER_BACKEND` | `lora\|baseline` | `lora` | Выбор локальной модели классификации |
+| `MODELS_DIR` | `Path` | `<root>/models` | Директория артефактов моделей |
+| `DEVICE` | `auto\|cpu\|cuda` | `auto` | Устройство вычислений PyTorch |
+| `CHUNK_CHARS` / `MAX_CHUNKS` | `int` / `int` | `1000` / `16` | Длина фрагмента и предел фрагментов на запрос |
 
-### Меры информационной безопасности
-* Поле `llm_api_key` обёрнуто в тип `pydantic.SecretStr`, маскирующий секрет при дампе настроек и в трассировках исключений (`SecretStr('**********')`).
-* Файлы `.env` и `.env.*` исключены из индекса Git (`.gitignore`) и контекста сборки образа (`.dockerignore`).
-* В `Dockerfile` отсутствуют директивы `ARG`/`ENV` с ключами — секрет передаётся исключительно при старте контейнера (`docker run -e LLM_API_KEY=...`).
+* Секрет `llm_api_key` обёрнут в `SecretStr`, исключён из Git (`.gitignore`) и образа Docker (`.dockerignore`).
+* Инструмент `calc` работает поверх белого списка AST-узлов (`ast.Constant`, `+`, `-`, `*`, `/`), исключая произвольное выполнение кода.
 
 ---
 
-## 8. Артефакты моделей и воспроизводимость обучения (`models/`, `notebooks/`)
+## 10. Артефакты моделей и воспроизводимость обучения (`models/`, `notebooks/`)
 
 | Путь | Назначение | Размер |
 |---|---|---:|
-| `models/tfidf_vectorizer.pkl` | Обученный посимвольный `TfidfVectorizer` (`(2,4)`, `50 000` признаков, `float32`) | `1.56 МБ` |
-| `models/label_encoder.pkl` | `LabelEncoder` со списком всех `64` авторов | `2 КБ` |
+| `models/tfidf_vectorizer.pkl` | Посимвольный `TfidfVectorizer` (`(2,4)`, `50 000` признаков, `float32`) | `1.56 МБ` |
+| `models/label_encoder.pkl` | `LabelEncoder` на `64` автора | `2 КБ` |
 | `models/baseline_pytorch.pt` | Чекпоинт `TextClassifier` (`model_state_dict`, `optim_state_dict`, метаданные) | `73.35 МБ` |
-| `models/lora_classifier/adapter_model.safetensors` | Веса LoRA-адаптера и классификационной головы `ruBert-base` | `9.30 МБ` |
+| `models/lora_classifier/adapter_model.safetensors` | Веса LoRA-адаптера и головы классификации `ruBert-base` | `9.30 МБ` |
 | `models/lora_classifier/adapter_config.json` | Параметры PEFT (`r=16`, `lora_alpha=32`, `target_modules`) | `1 КБ` |
-| `models/lora_classifier/labels.json` | Словарь классов (`64` автора), `max_length=256` и имя базового энкодера | `2 КБ` |
-| `models/lora_classifier/tokenizer.json` | Быстрый Rust-токенизатор WordPiece | `3.54 МБ` |
+| `models/lora_classifier/labels.json` | Список `64` классов, `max_length=256`, `base_model` | `2 КБ` |
+| `models/lora_classifier/tokenizer.json` | Быстрый WordPiece-токенизатор | `3.54 МБ` |
 
-Полный цикл исследований воспроизводится по порядку выполнения ноутбуков:
-1. `notebooks/01_eda_and_cleaning.ipynb` -> `data/processed/parsed_*.parquet`, `chunks_*.parquet`
-2. `notebooks/02_tfidf_experiments.ipynb` -> `models/tfidf_vectorizer.pkl`, `models/label_encoder.pkl`
-3. `notebooks/03_pytorch_baseline.ipynb` -> `models/baseline_pytorch.pt`
-4. `notebooks/04_lora_finetuning.ipynb` -> `models/lora_classifier/`
+Конвейер обучения в ноутбуках:
+1. `notebooks/01_eda_and_cleaning.ipynb` → `data/processed/parsed_*.parquet`, `chunks_*.parquet`
+2. `notebooks/02_tfidf_experiments.ipynb` → `models/tfidf_vectorizer.pkl`, `models/label_encoder.pkl`
+3. `notebooks/03_pytorch_baseline.ipynb` → `models/baseline_pytorch.pt`
+4. `notebooks/04_lora_finetuning.ipynb` → `models/lora_classifier/`
 
 ---
 
-## 9. Контейнеризация, развёртывание и эксплуатация
+## 11. Контейнеризация, развёртывание и эксплуатация
 
-### 9.1. Локальный запуск (Windows PowerShell / Linux)
+### 11.1. Docker (`Dockerfile`)
 
-```powershell
-cd SovTeh
-.venv\Scripts\uvicorn.exe src.app:app --host 0.0.0.0 --port 8000
-```
-
-### 9.2. Сборка и запуск в Docker
-
-Оптимизации `Dockerfile`:
-1. Базовый образ `python:3.11-slim` с `PYTHONDONTWRITEBYTECODE=1` и `PYTHONUNBUFFERED=1`.
-2. Установка CPU-сборки PyTorch (`--index-url https://download.pytorch.org/whl/cpu`) перед `requirements.txt`, сокращающая размер образа на ~`2.5 ГБ`.
-3. Предварительное кэширование базового энкодера `ai-forever/ruBert-base` в отдельном кэшируемом слое до копирования `src/` и `models/` — контейнер поднимается за ~2 секунды без скачивания 700 МБ при каждом запуске.
+* Базовый образ `python:3.11-slim`, установка CPU-версии PyTorch (`--index-url https://download.pytorch.org/whl/cpu`) перед `requirements.txt`.
+* Предварительное скачивание `ai-forever/ruBert-base` в слой образа при сборке.
+* Непривилегированный пользователь `appuser` (UID `1000`), копирование `src/`, `models/` и `reports/`.
+* Встроенный `HEALTHCHECK` на `http://localhost:8000/health` каждые 30 секунд.
 
 ```bash
-docker build -t doc-assistant .
-docker run --rm -p 8000:8000 -e LLM_API_KEY="your_api_key_here" doc-assistant
+docker build -t literary-style-assistant .
+docker run --rm -p 8000:8000 -e LLM_API_KEY="your_api_key_here" literary-style-assistant
 ```
 
-### 9.3. Рекомендации по выбору бэкенда под профиль нагрузки
+### 11.2. Рекомендации по выбору бэкенда под нагрузку
 
-* **`CLASSIFIER_BACKEND=lora` (по умолчанию):** оптимален при наличии GPU (`8.1 мс` на запрос) либо при умеренном RPS на CPU (`84.5 мс`), обеспечивает максимальный Macro-F1 на редких авторах при агрегации по длинным текстам (`98.53 %`).
-* **`CLASSIFIER_BACKEND=baseline`:** оптимален для легковесных CPU-контейнеров с жёсткими лимитами памяти и высоким RPS — задержка классификации составляет **`1.99 мс`** на CPU при потреблении менее `150 МБ` RAM.
+* **`CLASSIFIER_BACKEND=lora` (по умолчанию):** оптимален при наличии GPU (`8.13 мс` на запрос) или умеренном RPS на CPU (`84.48 мс`), даёт лучший Macro-F1 на полных документах (**`98.53 %`**).
+* **`CLASSIFIER_BACKEND=baseline`:** оптимален для легковесных CPU-серверов (`1.99 мс` на CPU) и быстрых тестов без скачивания трансформера.
 
 ---
 
-## 10. Система тестирования и контроля качества (`tests/`)
+## 12. Система тестирования и контроля качества (`tests/`)
 
-Пакет тестов разделён на четыре специализированных модуля:
+Пакет включает **7 модулей (`38` тестов)**, проверяющих предобработку, конфигурацию, модели, безопасность, агентные циклы, MLflow Registry и FastAPI:
 
 | Модуль | Проверяемая функциональность |
 |---|---|
-| `tests/test_preprocessing.py` | Все 4 шаблона извлечения автора, очистка битых экранирований и спецсимволов, нормализация, граничные случаи нарезки `chunk_text`, чтение JSONL. |
-| `tests/test_config_and_llm.py` | Автоопределение провайдеров (`Groq`, `OpenRouter`, `AI Studio`), приоритет переопределений, системный промпт, ретраи на `503` с переключением на fallback-модель, fast-fail на `401`, обработка тайм-аутов (`504`) и битого JSON (`502`). |
-| `tests/test_classifiers.py` | Отсутствие `Softmax` внутри `TextClassifier`, проверка градиентов `CrossEntropyLoss`, целостность сохранённых весов в `models/`, одно- и многофрагментный инференс `BaselineClassifier` и `LoraClassifier`. |
-| 	ests/test_api_and_e2e.py | Жизненный цикл lifespan, контракт /health, обработка пустых/пробельных вопросов (400), невалидных параметров (422), ошибок провайдера (503/504) и **живой сквозной тест POST /ask с реальной моделью uBERT+LoRA и внешним API Google AI Studio**. |
-| 	ests/test_adversarial_and_robustness.py | Стресс-тесты безопасности и DoS: защита от падения на невидимых пробелах/контрольных байтах (400 вместо 500), блокировка инъекций через имя автора, нарезка монолитных токенов (DoS), лимит длины 15000 и OOD-тесты. |
+| `tests/test_preprocessing.py` | Все 4 шаблона извлечения автора, очистка битых экранирований и невидимых символов, нормализация, нарезка `chunk_text`, чтение JSONL. |
+| `tests/test_config_and_llm.py` | Автоопределение провайдеров (`Groq`, `OpenRouter`, `AI Studio`), приоритет переопределений, системный промпт, ретраи на `503` с fallback-моделями, fast-fail на `401`, обработка `504` и `502`. |
+| `tests/test_classifiers.py` | Отсутствие `Softmax` внутри `TextClassifier`, прохождение градиентов, целостность артефактов в `models/`, инференс `BaselineClassifier` и `LoraClassifier`. |
+| `tests/test_adversarial_and_robustness.py` | Защита от падения на невидимых/управляющих символах (`400` вместо `500`), блокировка многострочных инъекций в regex автора, принудительная нарезка длинных слов без пробелов, лимит `15000` символов (`422`) и OOD-вводы. |
+| `tests/test_agents.py` | Все 3 инструмента (`classify_style`, `author_metrics`, `calc`), `run_tool` и Pydantic-валидация, `extract_json`, циклы Native / JSON / LangGraph (ошибки и `max_iterations`), `LLMClient.chat(tools=...)` и эндпоинт `POST /agent`. |
+| `tests/test_mlflow.py` | Прогон серии экспериментов в `sqlite:///`, логирование параметров/метрик/тегов/артефактов (`config`, `charts`) и регистрация лучшей модели в `Staging`. |
+| `tests/test_api_and_e2e.py` | Жизненный цикл `lifespan`, `/health`, `/classify`, `/ask`, проброс `504`/`503` и живой E2E-тест `POST /ask` с реальной `ruBERT+LoRA` и ключом из `.env`. |
 
-Команды запуска проверок:
+Команды проверки качества (совпадают с CI):
 
-```powershell
-# Полный прогон тестов с отчётом покрытия кода src/
-.venv\Scripts\pytest.exe tests -v --cov=src --cov-report=term-missing
-
-# Статический анализ и проверка соответствия PEP8
-uv tool run ruff check src tests --line-length 100
+```bash
+ruff check src tests agents_comparison.py --line-length 105
+CLASSIFIER_BACKEND=baseline pytest tests -v --cov=src --cov-report=term-missing -k "not test_live_e2e and not test_baseline_and_lora"
 ```
-
-
