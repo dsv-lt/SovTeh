@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from unittest.mock import AsyncMock, patch
 
 import httpx
 
 from src.config import Settings
-from src.llm_client import LLMClient, LLMError, build_system_prompt
+from src.llm_client import LLMClient, LLMError, build_rag_system_prompt, build_system_prompt
+from src.preprocessing import enforce_network_immunity
 
 
 class ConfigResolutionTests(unittest.TestCase):
@@ -30,6 +32,25 @@ class ConfigResolutionTests(unittest.TestCase):
             self.assertIn("generativelanguage.googleapis.com", s_ai.resolved_base_url)
             self.assertGreaterEqual(len(s_ai.resolved_candidate_models), 2)
 
+        s_oai = Settings(llm_api_key="sk-proj-sample123", _env_file=None)
+        self.assertEqual(s_oai.resolved_provider, "openai")
+        self.assertEqual(s_oai.resolved_model, "gpt-4o-mini")
+
+        s_gc = Settings(gigachat_credentials="BasicTokenSample==", _env_file=None)
+        self.assertEqual(s_gc.resolved_provider, "gigachat")
+        self.assertEqual(s_gc.resolved_model, "GigaChat-2")
+
+    def test_network_immunity_clears_windows_proxy_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"HTTP_PROXY": "http://127.0.0.1:8888", "HTTPS_PROXY": "http://127.0.0.1:8888"},
+        ):
+            env_info = enforce_network_immunity()
+            self.assertEqual(os.environ["HTTP_PROXY"], "")
+            self.assertEqual(os.environ["HTTPS_PROXY"], "")
+            self.assertIn("localhost", env_info["NO_PROXY"])
+            self.assertEqual(env_info["GIGACHAT_DISABLE_SSL"], "True")
+
     def test_explicit_overrides_take_precedence(self) -> None:
         s = Settings(
             llm_api_key="AQ.test",
@@ -49,6 +70,60 @@ class LLMClientUnitTests(unittest.IsolatedAsyncioTestCase):
         prompt = build_system_prompt("Гоголь Н")
         self.assertIn("Входной текст идентифицирован как стиль автора: Гоголь Н.", prompt)
         self.assertIn("образы автора Гоголь Н.", prompt)
+
+        rag_prompt = build_rag_system_prompt("Толстой А", "фантастика и фэнтези", exact_match=True)
+        self.assertIn("Толстой А", rag_prompt)
+        self.assertIn("фантастика и фэнтези", rag_prompt)
+        rag_fb = build_rag_system_prompt("Чехов А", "драма и мелодрама", exact_match=False)
+        self.assertIn("К сожалению, в локальной базе данных нет произведений точно по вашему описанию", rag_fb)
+
+    async def test_dynamic_model_discovery_filters_embeddings_and_recovers_from_404(self) -> None:
+        models_tried: list[str] = []
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            if req.method == "GET" and req.url.path.endswith("/models"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {"id": "text-embedding-3-small"},
+                            {"id": "whisper-1"},
+                            {"id": "GigaChat-2-Max"},
+                            {"id": "gpt-4.1-nano"},
+                        ]
+                    },
+                )
+            body = json.loads(req.content.decode("utf-8"))
+            models_tried.append(body["model"])
+            if body["model"] == "gpt-4o-mini":
+                return httpx.Response(404, json={"error": "model not found"})
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "Ответ динамически выбранной модели."}}]},
+            )
+
+        settings = Settings(llm_api_key="sk-proj-test", llm_max_retries=2, _env_file=None)
+        client = LLMClient(settings)
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(
+            base_url=settings.resolved_base_url,
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        )
+        answer = await client.generate_with_context(
+            question="Кто такой Лось?",
+            context_text="Аэлита: инженер Лось летит на Марс.",
+            predicted_author="Толстой А",
+            predicted_genre="фантастика и фэнтези",
+        )
+        await client.aclose()
+
+        self.assertEqual(answer, "Ответ динамически выбранной модели.")
+        self.assertNotIn("text-embedding-3-small", client.discovered_models)
+        self.assertNotIn("whisper-1", client.discovered_models)
+        self.assertEqual(client.discovered_models, ["GigaChat-2-Max", "gpt-4.1-nano"])
+        self.assertEqual(models_tried[0], "gpt-4o-mini")
+        self.assertIn(models_tried[-1], ("GigaChat-2-Max", "gpt-4.1-nano"))
 
     async def test_missing_api_key_raises_503(self) -> None:
         client = LLMClient(Settings(llm_api_key=None, _env_file=None))

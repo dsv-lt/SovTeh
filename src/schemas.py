@@ -10,9 +10,9 @@ class QueryRequest(BaseModel):
         ...,
         min_length=1,
         max_length=15000,
-        description="Фрагмент текста или запрос пользователя (до 15 000 символов)",
+        description="Запрос пользователя по сюжетам или фрагмент текста (до 15 000 символов)",
     )
-    k: int = Field(default=3, ge=1, le=10, description="Параметр для top-k авторов (опционально)")
+    k: int = Field(default=3, ge=1, le=10, description="Количество сюжетов / top-k авторов")
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
 
 
@@ -22,7 +22,16 @@ class AuthorScore(BaseModel):
 
 
 class QueryResponse(BaseModel):
-    predicted_author: str
+    answer: str = Field(default="", description="Контекстный ответ ИИ-агента по базе сюжетов")
+    sources: list[str] = Field(
+        default_factory=list,
+        description="Релевантные сюжеты из локальной базы знаний (RAG)",
+    )
+    predicted_author: str = Field(..., description="Ближайший авторский стиль (локальный классификатор)")
+    predicted_genre: str = Field(
+        default="драма и мелодрама",
+        description="Жанровая направленность (локальный ML-фильтр)",
+    )
     confidence: float
     model_name: str
     generated_text: str
@@ -52,6 +61,10 @@ class AgentRequest(BaseModel):
         pattern="^(native|json|framework)$",
         description="Архитектура агентного цикла: native, json или framework",
     )
+    mode: str | None = Field(
+        default=None,
+        description="Опциональный режим мультиагентного интерфейса: RAG, Аналитик или Критик",
+    )
     max_iterations: int = Field(default=6, ge=1, le=12, description="Максимум шагов цикла агента")
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
 
@@ -68,4 +81,4 @@ class AgentResponse(BaseModel):
     approach: str
     answer: str
     iterations: int
-    steps: list[AgentStepTrace]
+    steps: list[AgentStepTrace | str]

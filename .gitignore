@@ -1,5 +1,7 @@
 # Данные и промежуточные чекпоинты обучения
-data/
+data/raw/
+data/processed/
+!data/plots_dataset.csv
 reports/*.npy
 
 # Локальные артефакты MLflow и временные графики

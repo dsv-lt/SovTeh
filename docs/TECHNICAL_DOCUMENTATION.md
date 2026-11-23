@@ -1,7 +1,7 @@
 ﻿# Техническая документация проекта Literary Style Assistant
 
-**Версия:** 1.1.0  
-**Стек технологий:** Python 3.11 / 3.12, PyTorch (CUDA 12.8 / CPU), Hugging Face Transformers & PEFT (LoRA), Scikit-Learn, FastAPI, Pydantic v2, HTTPX, MLflow (`sqlite:///mlflow.db` + Model Registry + Tracing), LangChain & LangGraph, Ruff, Pytest, Docker
+**Версия:** 2.0.0  
+**Стек технологий:** Python 3.11 / 3.12, PyTorch (CUDA 12.8 / CPU), Hugging Face Transformers & PEFT (LoRA), Scikit-Learn (`HashingVectorizer`, `SGDClassifier`, `TfidfVectorizer`), FAISS (`IndexFlatIP` / PyTorch fallback), FastAPI, Streamlit, Pydantic v2, HTTPX, MLflow (`sqlite:///mlflow.db` + Model Registry + Tracing), LangChain & LangGraph, Ruff, Pytest, Docker
 
 ---
 
@@ -24,12 +24,14 @@
 
 ## 1. Назначение и обзор системы
 
-**Literary Style Assistant** — интеллектуальный микросервис анализа и стилизации русскоязычной художественной прозы, объединяющий четыре подсистемы:
+**SovTeh Hybrid RAG & AI Plot Assistant** — интеллектуальный микросервис контекстного анализа сюжетов, атрибуции литературного стиля и автономных агентных циклов, объединяющий четыре подсистемы:
 
-1. **Атрибуция литературного стиля (Стадия 1, локальный ИИ):** определение наиболее близкого классика русской литературы по полному набору из **64 авторов** корпуса `ViliamVolosV/russian_classic_literature` без сокращения классов. Вычисление выполняется локально (GPU или CPU) с возвратом предсказанного автора и калиброванной вероятности (`confidence`).
-2. **Управляемая стилизация (Стадия 2, внешний LLM API):** динамическая сборка системного промпта под найденного автора и асинхронный вызов OpenAI-совместимого API (**Google AI Studio / Gemini**, **Groq Cloud** или **OpenRouter**) с защитой от prompt-инъекций, ретраями и fallback-моделями.
-3. **MLOps-конвейер и CI/CD (`src/train_mlflow.py`, `.github/workflows/ci.yml`):** перебор гиперпараметров PyTorch-классификатора с записью запусков, графиков, JSON-конфигов и весов в **MLflow (`sqlite:///mlflow.db`)**, автоматической регистрацией лучшей модели в **MLflow Model Registry** (стадия `Staging`), а также автоматической проверкой `ruff` и `pytest` в GitHub Actions.
-4. **Автономные ИИ-агенты (`src/agents.py`, `agents_comparison.py`, `POST /agent`):** выполнение многошаговых составных запросов тремя архитектурами (**Native Tool Calling**, **JSON-цикл**, **LangGraph ReAct**) с тремя доменными инструментами (`classify_style`, `author_metrics`, `calc`), Pydantic-валидацией аргументов и трассировкой шагов в консоль и MLflow Tracing.
+1. **Двухэтапный RAG-конвейер (`src/rag.py`, `src/classifier.py`, `data/plots_dataset.csv`):**
+   * *Этап 1 (Локальный ML-фильтр):* `HashingVectorizer + SGDClassifier` классифицирует жанровую направленность запроса (7 макро-жанров), а `StyleClassifier` (`ruBERT-base + LoRA` или `PyTorch MLP`) определяет ближайший авторский стиль из **64 русских классиков**.
+   * *Этап 2 (Семантический поиск RuBERT + FAISS):* `FAISSVectorIndex` (`faiss.IndexFlatIP` с прозрачным PyTorch CUDA/CPU fallback) выполняет векторный поиск по 132 описаниям сюжетов в оперативной памяти.
+2. **Динамический универсальный шлюз LLM API (`src/llm_client.py`, `src/config.py`):** поддержка **любой модели по API** (**Google AI Studio**, **Groq**, **OpenRouter**, **OpenAI**, **Sber GigaChat** или кастомного `LLM_BASE_URL`), автоопрос доступных моделей (`GET /models`), защита от ошибок `404`, сетевой иммунитет (`enforce_network_immunity()` + `trust_env=False`) и кросс-платформенное кодирование (`UTF-8` / `CP1251`).
+3. **MLOps-конвейер и CI/CD (`src/train_mlflow.py`, `.github/workflows/ci.yml`):** перебор гиперпараметров в **MLflow (`sqlite:///mlflow.db`)**, регистрация лучшей модели **`literary-style-classifier`** в стадии `Staging` и автопроверка `ruff` + `pytest` в GitHub Actions.
+4. **Автономные ИИ-агенты и Streamlit UI (`src/agents.py`, `agents_comparison.py`, `ui.py`, `POST /agent`):** 4 инструмента (`classify_style`, `search_plots`, `author_metrics`, `calc`), 3 архитектуры (`Native`, `JSON`, `LangGraph`) и веб-режимы *RAG-Эксперт*, *Агент-Аналитик*, *Агент-Критик*.
 
 ---
 
@@ -159,8 +161,11 @@ sequenceDiagram
 | Провайдер | Префикс ключа | Базовый URL (`resolved_base_url`) | Основная модель | Резервные модели (`fallback_models`) |
 |---|---|---|---|---|
 | **Google AI Studio** (`aistudio`) | `AQ.` или `AIza` | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.1-flash-lite` | `gemini-flash-lite-latest`, `gemma-4-31b-it` |
-| **Groq Cloud** (`groq`) | `gsk_` *(и прочие)* | `https://api.groq.com/openai/v1` | `llama-3.1-8b-instant` | — |
-| **OpenRouter** (`openrouter`) | `sk-or-` | `https://openrouter.ai/api/v1` | `meta-llama/llama-3.3-70b-instruct:free` | — |
+| **Groq Cloud** (`groq`) | `gsk_` *(и прочие)* | `https://api.groq.com/openai/v1` | `llama-3.1-8b-instant` | `llama-3.3-70b-versatile` |
+| **OpenRouter** (`openrouter`) | `sk-or-` | `https://openrouter.ai/api/v1` | `meta-llama/llama-3.3-70b-instruct:free` | `google/gemini-2.0-flash-exp:free` |
+| **OpenAI** (`openai`) | `sk-` | `https://api.openai.com/v1` | `gpt-4o-mini` | `gpt-4.1-mini`, `gpt-3.5-turbo` |
+| **Sber GigaChat** (`gigachat`) | `GIGACHAT_CREDENTIALS` | `https://gigachat.devices.sberbank.ru/api/v1` | `GigaChat-2` | `GigaChat-2-Lite`, `GigaChat` |
+| **Custom / Local** (`custom`) | *(любой)* | `LLM_BASE_URL` (напр. `http://localhost:11434/v1`) | `LLM_MODEL` | автоопределение через `GET /models` |
 
 ### 5.2. Методы `chat()`, `generate()` и разбор `tool_calls`
 
@@ -188,12 +193,12 @@ sequenceDiagram
 * **Ответ `200 OK` (`ClassifyResponse`):** `predicted_author`, `confidence`, `model_name`, `top_authors: list[AuthorScore]`.
 
 ### 6.3. `POST /ask`
-Полный двухстадийный конвейер: локальная классификация + стилизованная генерация.
+Полный двухэтапный RAG-конвейер: локальный ML-фильтр жанра/стиля + семантический поиск RuBERT/FAISS + генерация точного ответа через API любой LLM.
 * **Вход (`QueryRequest`):** `question`, `k`, `temperature`.
-* **Ответ `200 OK` (`QueryResponse`):** `predicted_author`, `confidence`, `model_name`, `generated_text`.
+* **Ответ `200 OK` (`QueryResponse`):** `answer`, `sources`, `predicted_author`, `predicted_genre`, `confidence`, `model_name`, `generated_text`.
 
 ### 6.4. `POST /agent`
-Выполнение многошагового ИИ-агента с инструментами `classify_style`, `author_metrics`, `calc`.
+Выполнение многошагового ИИ-агента с инструментами `classify_style`, `search_plots`, `author_metrics`, `calc` либо запуск режимов UI (`mode`: `"Аналитик"` / `"Критик"` / `"RAG"`).
 
 * **Тело запроса (`AgentRequest`):**
   ```json
@@ -204,7 +209,7 @@ sequenceDiagram
     "temperature": 0.0
   }
   ```
-  Поля: `question` (`1..15000`), `approach` (`"native" | "json" | "framework"`, по умолчанию `"native"`), `max_iterations` (`1..12`, по умолчанию `6`), `temperature` (`0.0..2.0`, по умолчанию `0.0`).
+  Поля: `question` (`1..15000`), `approach` (`"native" | "json" | "framework"`, по умолчанию `"native"`), `mode` (`str | None`), `max_iterations` (`1..12`, по умолчанию `6`), `temperature` (`0.0..2.0`, по умолчанию `0.0`).
 * **Ответ `200 OK` (`AgentResponse`):**
   ```json
   {
@@ -343,21 +348,22 @@ docker run --rm -p 8000:8000 -e LLM_API_KEY="your_api_key_here" literary-style-a
 
 ## 12. Система тестирования и контроля качества (`tests/`)
 
-Пакет включает **7 модулей (`38` тестов)**, проверяющих предобработку, конфигурацию, модели, безопасность, агентные циклы, MLflow Registry и FastAPI:
+Пакет включает **8 модулей (`44` теста)**, проверяющих предобработку, кодировки UTF-8/CP1251, RAG-поиск, сетевую изоляцию, конфигурацию и автопоиск моделей LLM, классификаторы, безопасность, агентные циклы, MLflow Registry и FastAPI:
 
 | Модуль | Проверяемая функциональность |
 |---|---|
 | `tests/test_preprocessing.py` | Все 4 шаблона извлечения автора, очистка битых экранирований и невидимых символов, нормализация, нарезка `chunk_text`, чтение JSONL. |
-| `tests/test_config_and_llm.py` | Автоопределение провайдеров (`Groq`, `OpenRouter`, `AI Studio`), приоритет переопределений, системный промпт, ретраи на `503` с fallback-моделями, fast-fail на `401`, обработка `504` и `502`. |
+| `tests/test_config_and_llm.py` | Автоопределение провайдеров (`AI Studio`, `Groq`, `OpenRouter`, `OpenAI`, `GigaChat`), сетевой иммунитет (`enforce_network_immunity`), динамический `discover_models()` и восстановление от `404`, ретраи и обработка ошибок `504`/`502`. |
+| `tests/test_rag.py` | Датасет `data/plots_dataset.csv` (все 64 автора), чтение `UTF-8` / `CP1251`, `HashingVectorizer + SGDClassifier`, `FAISSVectorIndex`, точный RAG-поиск и high-rating fallback, режимы `Аналитик` и `Критик`. |
 | `tests/test_classifiers.py` | Отсутствие `Softmax` внутри `TextClassifier`, прохождение градиентов, целостность артефактов в `models/`, инференс `BaselineClassifier` и `LoraClassifier`. |
 | `tests/test_adversarial_and_robustness.py` | Защита от падения на невидимых/управляющих символах (`400` вместо `500`), блокировка многострочных инъекций в regex автора, принудительная нарезка длинных слов без пробелов, лимит `15000` символов (`422`) и OOD-вводы. |
-| `tests/test_agents.py` | Все 3 инструмента (`classify_style`, `author_metrics`, `calc`), `run_tool` и Pydantic-валидация, `extract_json`, циклы Native / JSON / LangGraph (ошибки и `max_iterations`), `LLMClient.chat(tools=...)` и эндпоинт `POST /agent`. |
+| `tests/test_agents.py` | Все 4 инструмента (`classify_style`, `search_plots`, `author_metrics`, `calc`), `run_tool` и Pydantic-валидация, `extract_json`, циклы Native / JSON / LangGraph (ошибки и `max_iterations`), `LLMClient.chat(tools=...)` и эндпоинт `POST /agent` (включая UI-режимы `Аналитик`/`Критик`). |
 | `tests/test_mlflow.py` | Прогон серии экспериментов в `sqlite:///`, логирование параметров/метрик/тегов/артефактов (`config`, `charts`) и регистрация лучшей модели в `Staging`. |
-| `tests/test_api_and_e2e.py` | Жизненный цикл `lifespan`, `/health`, `/classify`, `/ask`, проброс `504`/`503` и живой E2E-тест `POST /ask` с реальной `ruBERT+LoRA` и ключом из `.env`. |
+| `tests/test_api_and_e2e.py` | Жизненный цикл `lifespan`, `/health`, `/classify`, `/ask` (включая `UTF-8` заголовок и RAG `sources`), проброс `504`/`503` и живой E2E-тест `POST /ask`. |
 
 Команды проверки качества (совпадают с CI):
 
 ```bash
-ruff check src tests agents_comparison.py --line-length 105
+ruff check src tests agents_comparison.py ui.py test_request.py --line-length 105
 CLASSIFIER_BACKEND=baseline pytest tests -v --cov=src --cov-report=term-missing -k "not test_live_e2e and not test_baseline_and_lora"
 ```

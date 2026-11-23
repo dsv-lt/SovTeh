@@ -16,8 +16,9 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 # Создание непривилегированного пользователя для безопасного запуска
 RUN useradd -u 1000 -m appuser && chown -R appuser:appuser /app
 
-# Шаг 2: Копирование исходного кода, обученных артефактов и метрик
+# Шаг 2: Копирование исходного кода, датасета сюжетов, обученных артефактов и метрик
 COPY --chown=appuser:appuser src/ ./src/
+COPY --chown=appuser:appuser data/plots_dataset.csv ./data/plots_dataset.csv
 COPY --chown=appuser:appuser models/ ./models/
 COPY --chown=appuser:appuser reports/ ./reports/
 

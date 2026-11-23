@@ -131,35 +131,38 @@
 
 ## 7. Верификация качества и результаты автотестов (`pytest` + `pytest-cov` + `ruff`)
 
-Разработан полный тестовый пакет из **38 тестовых сценариев** в **7 модулях** (`test_preprocessing.py`, `test_config_and_llm.py`, `test_classifiers.py`, `test_adversarial_and_robustness.py`, `test_agents.py`, `test_mlflow.py`, `test_api_and_e2e.py`).
+Разработан полный тестовый пакет из **44 тестовых сценариев** в **8 модулях** (`test_preprocessing.py`, `test_config_and_llm.py`, `test_classifiers.py`, `test_adversarial_and_robustness.py`, `test_agents.py`, `test_mlflow.py`, `test_api_and_e2e.py`, `test_rag.py`).
 
-При автономном офлайн-прогоне без живого облачного API и тяжёлой загрузки LoRA (`CLASSIFIER_BACKEND=baseline pytest tests -v --cov=src --cov-report=term-missing -k "not test_live_e2e and not test_baseline_and_lora"`) успешно проходят **36 тестов** (+ 5 подтестов) со средним покрытием **89 %** по `src/` (1 067 операторов):
+При автономном офлайн-прогоне без живого облачного API и тяжёлой загрузки LoRA (`CLASSIFIER_BACKEND=baseline pytest tests -v --cov=src --cov-report=term-missing -k "not test_live_e2e and not test_baseline_and_lora"`) успешно проходят **42 теста** (+ 5 подтестов) со средним покрытием **84 %** по `src/` (1 625 операторов):
 
 | Модуль исходного кода | Операторов (`Stmts`) | Пропущено (`Miss`) | Покрытие (`Cover`) |
 |---|---:|---:|---:|
 | `src/__init__.py` | 0 | 0 | **100 %** |
-| `src/schemas.py` | 38 | 0 | **100 %** |
-| `src/config.py` | 63 | 1 | **98 %** |
-| `src/preprocessing.py` | 67 | 2 | **97 %** |
-| `src/app.py` | 115 | 6 | **95 %** |
-| `src/llm_client.py` | 123 | 11 | **91 %** |
+| `src/schemas.py` | 42 | 0 | **100 %** |
+| `src/config.py` | 95 | 2 | **98 %** |
+| `src/preprocessing.py` | 95 | 5 | **95 %** |
+| `src/app.py` | 138 | 12 | **91 %** |
 | `src/train_mlflow.py` | 228 | 28 | **88 %** |
-| `src/agents.py` | 328 | 43 | **87 %** |
+| `src/agents.py` | 348 | 51 | **85 %** |
+| `src/llm_client.py` | 236 | 45 | **81 %** |
 | `src/classifier.py` *(без ветки LoRA на baseline-прогоне)* | 105 | 28 | **73 %** |
-| **ИТОГО (`src/`)** | **1 067** | **119** | **89 %** |
+| `src/rag.py` *(без ветки RuBERT/FAISS-C при запуске с baseline)* | 338 | 91 | **73 %** |
+| **ИТОГО (`src/`)** | **1 625** | **262** | **84 %** |
 
-* Статический анализатор `ruff check src tests agents_comparison.py --line-length 105` — **0 ошибок** (`All checks passed!`).
-* В ходе модульного тестирования выявлен и устранён дефект обработки невидимых символов нулевой ширины (`\u200b`, `\ufeff`) в `clean_text()`, которые ранее заменялись на видимый пробел вместо удаления.
+* Статический анализатор `ruff check src tests agents_comparison.py ui.py test_request.py --line-length 105` — **0 ошибок** (`All checks passed!`).
+* Реализованы и протестированы: гибридный RAG-пайплайн (`HashingVectorizer` + `SGDClassifier` + векторный индекс `FAISSVectorIndex`), динамическое обнаружение моделей (`GET /models`) и автовосстановление при `404`, изоляция прокси Windows (`enforce_network_immunity()` + `trust_env=False`), кросс-платформенное чтение `UTF-8` / `CP1251` и оба UI-режима (`Аналитик` / `Критик`).
 
 ---
 
-## 8. MLOps-конвейер (MLflow) и три архитектуры ИИ-агентов
+## 8. MLOps-конвейер (MLflow), RAG и три архитектуры ИИ-агентов
 
 1. **MLOps (`src/train_mlflow.py`):**
    * Хранилище `sqlite:///mlflow.db`, эксперимент `doc-classifier`, перебор сетки гиперпараметров (`lr`, `epochs`).
    * Логирование параметров, метрик (`train_loss`, `test_accuracy`, `test_f1_macro`), тегов (`assignment=mlops-task-1`), артефактов (`config/run_config.json`, `charts/accuracy_chart.png`) и PyTorch-модели (`mlflow.pytorch.log_model` с `signature` и `input_example`).
    * Автоматическая регистрация лучшей модели `literary-style-classifier` в MLflow Model Registry и перевод в стадию **`Staging`** (тег `stage=Staging`, алиас `@staging` и stage-переход).
-2. **ИИ-агенты (`src/agents.py`, `agents_comparison.py`, `POST /agent`):**
-   * 3 доменных инструмента с docstring-контрактами и Pydantic-валидацией: `classify_style`, `author_metrics`, `calc` + защищённая обёртка `run_tool`.
-   * 3 реализации цикла: **Native Tool Calling** (`TOOL_SCHEMAS`, `tool_call_id`), **JSON-цикл** (`extract_json`, логирование `raw`), **LangGraph** (`create_react_agent`), а также трассировка в консоль и MLflow Tracing (`doc-classifier-agents`).
-   * Автотесты в `tests/test_agents.py` и `tests/test_mlflow.py` проверяют инструменты, восстановление после ошибок, `max_iterations` с замоканными LLM, эндпоинт `POST /agent` и MLflow Model Registry.
+2. **Гибридная RAG-система и универсальный LLM-шлюз (`src/rag.py`, `src/llm_client.py`, `data/plots_dataset.csv`):**
+   * Локальная база из 132 описаний сюжетов по всем 64 авторам классификатора и 7 макро-жанрам.
+   * Двухэтапный конвейер: локальный ML-фильтр (`HashingVectorizer` + `SGDClassifier` + `StyleClassifier`) → векторный поиск (`FAISSVectorIndex` с поддержкой RuBERT/FAISS/CUDA GPU) → динамический шлюз к любой LLM по API (`Google AI Studio`, `Groq`, `OpenRouter`, `OpenAI`, `GigaChat`, `custom`).
+3. **ИИ-агенты (`src/agents.py`, `agents_comparison.py`, `ui.py`, `POST /agent`):**
+   * 4 доменных инструмента с docstring-контрактами и Pydantic-валидацией: `classify_style`, `search_plots`, `author_metrics`, `calc` + защищённая обёртка `run_tool`.
+   * 3 реализации цикла: **Native Tool Calling** (`TOOL_SCHEMAS`, `tool_call_id`), **JSON-цикл** (`extract_json`, логирование `raw`), **LangGraph** (`create_react_agent`), а также трассировка в консоль и MLflow Tracing (`doc-classifier-agents`) и веб-режимы `Аналитик` / `Критик`.

@@ -27,6 +27,7 @@ from src.agents import (
     tool_author_metrics,
     tool_calc,
     tool_classify_style,
+    tool_search_plots,
 )
 from src.app import app
 from src.classifier import StyleClassifier
@@ -98,6 +99,10 @@ class AgentToolsTests(unittest.TestCase):
         self.assertEqual(clf_res["predicted_author"], "Чехов А")
         self.assertEqual(len(clf_res["top_3"]), 3)
 
+        plots_res = json.loads(tool_search_plots("космическая экспедиция к Марсу"))
+        self.assertTrue(plots_res["exact_match"])
+        self.assertTrue(any("Аэлита" in item for item in plots_res["results"]))
+
     def test_run_tool_handles_unknown_and_validation_errors(self) -> None:
         err_unknown = run_tool("lookup", {"query": "Чехов"})
         self.assertIn("неизвестный инструмент", err_unknown)
@@ -158,7 +163,7 @@ class AgentLoopsMockTests(unittest.TestCase):
         seen_messages: list[list[dict[str, Any]]] = []
 
         def mock_native(messages: list[dict[str, Any]], schemas: list[dict[str, Any]]) -> LLMChatResult:
-            self.assertEqual(len(schemas), 3)
+            self.assertEqual(len(schemas), 4)
             seen_messages.append(list(messages))
             tool_msgs = [m for m in messages if m.get("role") == "tool"]
             if len(tool_msgs) == 0:
@@ -257,6 +262,7 @@ class AgentFastAPIEndpointTests(unittest.TestCase):
         class MockAgentLLM:
             def __init__(self, *_a: object, **_kw: object) -> None:
                 self.aclose = AsyncMock()
+                self.generate = AsyncMock(return_value="Аналитический ответ по базе сюжетов.")
 
             async def chat(
                 self,
@@ -296,6 +302,20 @@ class AgentFastAPIEndpointTests(unittest.TestCase):
             self.assertEqual(r_fw.status_code, 200)
             self.assertEqual(r_fw.json()["approach"], "framework")
             self.assertGreaterEqual(len(r_fw.json()["steps"]), 2)
+
+            r_analyst = client.post(
+                "/agent", json={"question": "Сравни средний рейтинг фантастики", "mode": "Аналитик"}
+            )
+            self.assertEqual(r_analyst.status_code, 200)
+            self.assertEqual(r_analyst.json()["approach"], "analyst")
+            self.assertGreaterEqual(len(r_analyst.json()["steps"]), 2)
+
+            r_critic = client.post(
+                "/agent", json={"question": "Посоветуй мистический сюжет", "mode": "Критик"}
+            )
+            self.assertEqual(r_critic.status_code, 200)
+            self.assertEqual(r_critic.json()["approach"], "critic")
+            self.assertGreaterEqual(len(r_critic.json()["steps"]), 2)
 
             # Валидация пустого ввода и неверного подхода
             self.assertEqual(client.post("/agent", json={"question": "   "}).status_code, 400)

@@ -1,4 +1,4 @@
-"""FastAPI-приложение двухстадийного сервиса классификации стиля и генерации текста."""
+"""FastAPI-приложение гибридного RAG-агента, классификации стиля и контекстного анализа сюжетов."""
 
 from __future__ import annotations
 
@@ -22,8 +22,19 @@ from src.agents import (
 )
 from src.classifier import StyleClassifier, load_classifier
 from src.config import get_settings
-from src.llm_client import LLMClient, LLMError, build_system_prompt
-from src.preprocessing import normalize_for_model
+from src.llm_client import LLMClient, LLMError, build_rag_system_prompt
+from src.preprocessing import (
+    configure_cross_platform_stdio,
+    enforce_network_immunity,
+    normalize_for_model,
+)
+from src.rag import (
+    build_index,
+    rag_answer_async,
+    rag_search,
+    run_analyst_agent_async,
+    run_critic_agent_async,
+)
 from src.schemas import (
     AgentRequest,
     AgentResponse,
@@ -33,6 +44,9 @@ from src.schemas import (
     QueryRequest,
     QueryResponse,
 )
+
+enforce_network_immunity()
+configure_cross_platform_stdio()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,9 +63,11 @@ class UTF8JSONResponse(JSONResponse):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Единоразовая загрузка моделей в память при старте и освобождение при остановке."""
+    """Единоразовая загрузка моделей, RAG-индекса и шлюза LLM в память при старте."""
     settings = get_settings()
-    logger.info("Starting Literary Style Assistant (backend=%s)", settings.classifier_backend)
+    if settings.bypass_system_proxy:
+        enforce_network_immunity()
+    logger.info("Starting SovTeh AI Plot & Style Agent (backend=%s)", settings.classifier_backend)
 
     vectorizer = None
     if settings.vectorizer_path.exists():
@@ -60,6 +76,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     classifier = load_classifier(settings, vectorizer=vectorizer)
     llm_client = LLMClient(settings)
+
+    await asyncio.to_thread(build_index, settings, classifier)
+    if (
+        settings.llm_auto_discover_models
+        and getattr(llm_client, "configured", False)
+        and hasattr(llm_client, "discover_models")
+    ):
+        try:
+            await llm_client.discover_models()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Пропущен автопоиск моделей при старте: %s", exc)
 
     app.state.settings = settings
     app.state.classifier = classifier
@@ -85,9 +112,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="Literary Style Assistant API",
-    description="Двухстадийный сервис классификации литературного стиля 64 русских авторов и стилизованной генерации текста.",
-    version="1.0.0",
+    title="SovTeh Hybrid RAG & AI Plot Assistant API",
+    description=(
+        "Гибридный ИИ-агент: локальный ML-фильтр жанра и стиля (64 автора), "
+        "семантический поиск (RuBERT + FAISS) по подготовленному датасету сюжетов "
+        "и динамический шлюз к любой LLM по API с сетевым иммунитетом Windows."
+    ),
+    version="2.0.0",
     lifespan=lifespan,
     default_response_class=UTF8JSONResponse,
     docs_url="/docs",
@@ -131,8 +162,7 @@ async def health(request: Request) -> HealthResponse:
 
 @app.post("/classify", response_model=ClassifyResponse)
 async def classify(payload: QueryRequest, request: Request) -> ClassifyResponse:
-    """Локальная классификация стиля автора (стадия 1 без обращения к внешней LLM)."""
-    # Нормализация удаляет управляющие символы и невидимые пробелы
+    """Локальная классификация стиля автора (офлайн, без обращения к внешней LLM)."""
     cleaned = normalize_for_model(payload.question)
     if not cleaned:
         raise HTTPException(status_code=400, detail="Пустой вопрос")
@@ -155,7 +185,7 @@ async def classify(payload: QueryRequest, request: Request) -> ClassifyResponse:
 
 @app.post("/ask", response_model=QueryResponse)
 async def ask(payload: QueryRequest, request: Request) -> QueryResponse:
-    """Полный конвейер: классификация автора (стадия 1) + генерация в его стиле (стадия 2)."""
+    """Двухэтапный RAG-конвейер: ML-фильтр + семантический поиск RuBERT/FAISS + ответ LLM по API."""
     cleaned = normalize_for_model(payload.question)
     if not cleaned:
         raise HTTPException(status_code=400, detail="Пустой вопрос")
@@ -168,19 +198,37 @@ async def ask(payload: QueryRequest, request: Request) -> QueryResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Пустой вопрос") from exc
 
-    system_prompt = build_system_prompt(pred.author)
+    predicted_genre, sources, _matched_items, exact_match = await asyncio.to_thread(
+        rag_search,
+        cleaned,
+        payload.k,
+        pred.author,
+    )
+    context_text = "\n\n".join(sources)
+    system_prompt = build_rag_system_prompt(
+        predicted_author=pred.author,
+        predicted_genre=predicted_genre,
+        exact_match=exact_match,
+    )
+    user_message = (
+        f"Выписка из базы данных сюжетов:\n{context_text}\n\n"
+        f'Запрос пользователя:\n"""{cleaned}"""'
+    )
 
     try:
         generated_text = await llm_client.generate(
             system_prompt=system_prompt,
-            user_message=cleaned,
+            user_message=user_message,
             temperature=payload.temperature,
         )
     except LLMError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     return QueryResponse(
+        answer=generated_text,
+        sources=sources,
         predicted_author=pred.author,
+        predicted_genre=predicted_genre,
         confidence=round(pred.confidence, 4),
         model_name=classifier.name,
         generated_text=generated_text,
@@ -189,7 +237,7 @@ async def ask(payload: QueryRequest, request: Request) -> QueryResponse:
 
 @app.post("/agent", response_model=AgentResponse)
 async def agent_endpoint(payload: AgentRequest, request: Request) -> AgentResponse:
-    """Многошаговый ИИ-агент с инструментами (native / json / framework)."""
+    """Многошаговый ИИ-агент с инструментами (native/json/framework) и режимами UI (Аналитик/Критик)."""
     cleaned = normalize_for_model(payload.question)
     if not cleaned:
         raise HTTPException(status_code=400, detail="Пустой вопрос")
@@ -200,6 +248,32 @@ async def agent_endpoint(payload: AgentRequest, request: Request) -> AgentRespon
     settings = getattr(request.app.state, "settings", None) or get_settings()
 
     try:
+        if payload.mode:
+            if "Аналитик" in payload.mode:
+                answer, steps = await run_analyst_agent_async(
+                    cleaned, llm_client, temperature=payload.temperature
+                )
+                return AgentResponse(
+                    approach="analyst",
+                    answer=answer,
+                    iterations=len(steps),
+                    steps=steps,
+                )
+            if "Критик" in payload.mode:
+                answer, steps = await run_critic_agent_async(
+                    cleaned, llm_client, temperature=payload.temperature
+                )
+                return AgentResponse(
+                    approach="critic",
+                    answer=answer,
+                    iterations=len(steps),
+                    steps=steps,
+                )
+            answer, docs, _genre = await rag_answer_async(
+                cleaned, llm_client, temperature=payload.temperature
+            )
+            return AgentResponse(approach="rag", answer=answer, iterations=1, steps=docs)
+
         if payload.approach == "json":
             result = await run_json_agent_async(
                 user_query=cleaned,

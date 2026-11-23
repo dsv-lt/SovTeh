@@ -33,6 +33,11 @@ from src.agents import (
 from src.classifier import BaselineClassifier
 from src.config import PROJECT_ROOT, get_settings
 from src.llm_client import LLMChatResult, LLMClient, ToolCall
+from src.preprocessing import configure_cross_platform_stdio, enforce_network_immunity
+from src.rag import build_index
+
+enforce_network_immunity()
+configure_cross_platform_stdio()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -186,7 +191,9 @@ def _print_result(res: AgentResult) -> None:
 def compare_all(query: str, use_mock: bool = False, trace_mlflow: bool = False) -> list[AgentResult]:
     """Запускает и сравнивает 3 подхода на одном составном запросе."""
     settings = get_settings()
-    set_agent_classifier(BaselineClassifier(settings))
+    clf = BaselineClassifier(settings)
+    set_agent_classifier(clf)
+    build_index(settings=settings, classifier=clf)
 
     if trace_mlflow:
         mlflow.set_tracking_uri(f"sqlite:///{(PROJECT_ROOT / 'mlflow.db').as_posix()}")

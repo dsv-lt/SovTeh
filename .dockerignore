@@ -2,7 +2,8 @@ venv/
 .venv/
 __pycache__/
 *.pyc
-data/
+data/raw/
+data/processed/
 .git/
 .gitignore
 .env

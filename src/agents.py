@@ -38,6 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from src.classifier import BaselineClassifier, StyleClassifier, load_classifier
 from src.config import PROJECT_ROOT, Settings, get_settings
 from src.llm_client import LLMChatResult, LLMClient, LLMError
+from src.preprocessing import enforce_network_immunity
 from src.schemas import AgentStepTrace
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,15 @@ class CalcArgs(BaseModel):
         ...,
         min_length=1,
         description="Арифметическое выражение из чисел и операторов + - * / ( )",
+    )
+
+
+class SearchPlotsArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(
+        ...,
+        min_length=1,
+        description="Поисковый запрос или тема сюжета (например, 'космическая экспедиция к Марсу')",
     )
 
 
@@ -248,14 +258,38 @@ def tool_calc(expression: str) -> str:
     return f"{rounded:.6f}".rstrip("0").rstrip(".")
 
 
+def tool_search_plots(query: str) -> str:
+    """Найти релевантные произведения и описания сюжетов в подготовленном датасете.
+
+    Используй, когда нужно найти сюжет по теме, событию, персонажу, жанру или автору
+    в локальной базе знаний (data/plots_dataset.csv). Не используй для расчётов.
+    """
+    cleaned = query.strip()
+    if not cleaned:
+        raise ValueError("Поисковый запрос не может быть пустым")
+    from src.rag import rag_search
+
+    genre, docs, _items, exact = rag_search(cleaned, k=3)
+    return json.dumps(
+        {
+            "predicted_genre": genre,
+            "exact_match": exact,
+            "results": docs,
+        },
+        ensure_ascii=False,
+    )
+
+
 TOOLS: dict[str, Callable[..., str]] = {
     "classify_style": tool_classify_style,
+    "search_plots": tool_search_plots,
     "author_metrics": tool_author_metrics,
     "calc": tool_calc,
 }
 
 TOOL_ARG_MODELS: dict[str, type[BaseModel]] = {
     "classify_style": ClassifyStyleArgs,
+    "search_plots": SearchPlotsArgs,
     "author_metrics": AuthorMetricsArgs,
     "calc": CalcArgs,
 }
@@ -347,21 +381,23 @@ class AgentResult(BaseModel):
 
 
 NATIVE_SYSTEM_PROMPT = (
-    "Ты — интеллектуальный ассистент по анализу русского литературного стиля. "
+    "Ты — интеллектуальный ассистент по анализу русского литературного стиля и сюжетов. "
     "У тебя есть инструменты: classify_style (определение автора по тексту), "
+    "search_plots (семантический поиск сюжетов в подготовленном датасете), "
     "author_metrics (метрики авторов из отчётов) и calc (арифметический калькулятор). "
     "Вызывай необходимые инструменты последовательно, пока не соберёшь все точные факты, "
     "затем дай ясный финальный ответ на русском языке."
 )
 
 JSON_SYSTEM_PROMPT = (
-    "Ты — интеллектуальный ассистент по анализу русского литературного стиля.\n"
+    "Ты — интеллектуальный ассистент по анализу русского литературного стиля и сюжетов.\n"
     "Доступные инструменты:\n"
     "- classify_style(text) — определить вероятного автора по фрагменту текста;\n"
+    "- search_plots(query) — найти произведения и сюжеты в базе данных по запросу;\n"
     "- author_metrics(author_query) — получить precision/recall/f1_score автора (или 'overall');\n"
     "- calc(expression) — вычислить арифметическое выражение.\n\n"
     "На каждом шаге верни ТОЛЬКО один JSON-объект без пояснений:\n"
-    '{"action": "classify_style|author_metrics|calc|final", "input": "...", "answer": "..."}\n'
+    '{"action": "classify_style|search_plots|author_metrics|calc|final", "input": "...", "answer": "..."}\n'
     "Для action=final заполни поле answer, для вызова инструмента — поле input.\n"
     "Используй инструменты, пока не соберёшь все данные для ответа."
 )
@@ -645,20 +681,36 @@ def run_json_agent(
 def build_langchain_chat_model(settings: Settings | None = None, temperature: float = 0.0) -> Any:
     """Создаёт ``ChatOpenAI`` на базе конфигурации провайдера из ``Settings``."""
     cfg = settings or get_settings()
-    if not cfg.llm_api_key or not cfg.llm_api_key.get_secret_value().strip():
+    if cfg.bypass_system_proxy:
+        enforce_network_immunity()
+    api_key = cfg.effective_api_key
+    if not api_key or not api_key.get_secret_value().strip():
         raise LLMError("LLM_API_KEY не задан: передайте ключ через переменную окружения", 503)
 
+    import httpx
     from langchain_openai import ChatOpenAI
 
     headers = {"X-Title": "Literary Style Assistant"} if cfg.resolved_provider == "openrouter" else None
+    http_client = httpx.Client(
+        timeout=cfg.llm_timeout,
+        trust_env=not cfg.bypass_system_proxy,
+        verify=cfg.resolved_provider != "gigachat",
+    )
+    http_async_client = httpx.AsyncClient(
+        timeout=cfg.llm_timeout,
+        trust_env=not cfg.bypass_system_proxy,
+        verify=cfg.resolved_provider != "gigachat",
+    )
     return ChatOpenAI(
-        api_key=cfg.llm_api_key.get_secret_value().strip(),
+        api_key=api_key.get_secret_value().strip(),
         base_url=cfg.resolved_base_url.rstrip("/"),
         model=cfg.resolved_model,
         temperature=temperature,
         timeout=cfg.llm_timeout,
         max_retries=cfg.llm_max_retries,
         default_headers=headers,
+        http_client=http_client,
+        http_async_client=http_async_client,
     )
 
 
@@ -667,6 +719,11 @@ def _make_langgraph_tools() -> list[Any]:
     def classify_style(text: str) -> str:
         """Определить наиболее вероятного русского писателя-классика по фрагменту текста."""
         return run_tool("classify_style", {"text": text})
+
+    @lc_tool
+    def search_plots(query: str) -> str:
+        """Найти произведения и описания сюжетов в локальном датасете по запросу."""
+        return run_tool("search_plots", {"query": query})
 
     @lc_tool
     def author_metrics(author_query: str) -> str:
@@ -678,7 +735,7 @@ def _make_langgraph_tools() -> list[Any]:
         """Вычислить арифметическое выражение, например '0.9394 - 0.8934'."""
         return run_tool("calc", {"expression": expression})
 
-    return [classify_style, author_metrics, calc]
+    return [classify_style, search_plots, author_metrics, calc]
 
 
 def _extract_framework_steps(messages: list[Any]) -> list[AgentStepTrace]:

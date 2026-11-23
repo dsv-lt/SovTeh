@@ -10,22 +10,22 @@
 
 ### 1.1. Главная идея в двух словах
 
-Представьте литературную мастерскую, где классификация, генерация, контроль версий моделей и многошаговый анализ разделены на понятные роли:
-1. **Литературовед-криминалист** (работает **локально** на вашем компьютере, без интернета). Вы даёте ему любой отрывок текста или фразу — и он за доли секунды определяет, на чью манеру письма из **64 русских классиков** (от Пушкина, Гоголя, Достоевского и Толстого до Лескова, Розанова, Аверченко и Братьев Стругацких) этот текст похож больше всего.
-2. **Писатель-стилизатор** (большая облачная нейросеть — Google Gemini, Llama в Groq или OpenRouter). Получив от криминалиста точный вердикт — например, *«Это Достоевский Ф с уверенностью 89%»* — стилизатор получает строгую инструкцию перевоплотиться в этого автора и продолжить ваш текст или ответить на ваш вопрос его языком, ритмом фразы и пунктуацией.
-3. **ИИ-агент с инструментами** (умеет выполнять **составные запросы в несколько шагов**): сам определяет стиль отрывка, смотрит тестовые метрики писателей из отчётов проекта и вычисляет нужные числа на безопасном калькуляторе.
-4. **Инженер MLOps и CI/CD**: автоматически записывает эксперименты перебора гиперпараметров, графики точности и веса в **MLflow**, переводит лучшую модель в стадию **`Staging`**, а при каждом изменении кода прогоняет линтер и автотесты.
+Представьте интеллектуальную систему анализа сюжетов и литературных текстов, где роли чётко разделены:
+1. **Локальный ML-фильтр жанра и стиля** (работает **локально** на вашем компьютере, без интернета). Мгновенно определяет жанровую направленность запроса через `HashingVectorizer + SGDClassifier` (7 макро-жанров) и ближайший авторский стиль из **64 русских классиков** (`ruBERT-base + LoRA` или `PyTorch MLP`).
+2. **Семантический поиск (RuBERT + FAISS) по базе сюжетов (`data/plots_dataset.csv`)**: векторный индекс находит наиболее подходящие описания произведений (132 сюжета по всем 64 авторам) с аппаратным ускорением на **NVIDIA CUDA GPU** или CPU. При отсутствии точных совпадений система честно предупреждает об этом и рекомендует топ по рейтингу.
+3. **Универсальный шлюз к любой LLM по API (`src/llm_client.py`)**: работает с Google Gemini (AI Studio), Groq Cloud, OpenRouter, OpenAI, Sber GigaChat или любым кастомным URL (`LLM_BASE_URL` + `LLM_MODEL`). При старте автоматически опрашивает доступные модели (`GET /models`) и изолирует процесс Python от системных прокси/VPN Windows (`enforce_network_immunity()`).
+4. **ИИ-агенты и веб-интерфейс Streamlit (`src/agents.py`, `ui.py`)**: 4 инструмента (`classify_style`, `search_plots`, `author_metrics`, `calc`), 3 архитектуры циклов (`Native`, `JSON`, `LangGraph`), режимы веб-UI (*RAG-Эксперт*, *Агент-Аналитик*, *Агент-Критик*) и MLOps-конвейер в **MLflow**.
 
 ```mermaid
 flowchart LR
-    User["Вы (текст или составной вопрос)"] --> Branch{"Выбор сценария"}
+    User["Вы (вопрос по сюжетам или текст)"] --> Branch{"Выбор сценария"}
     Branch -->|"POST /classify"| ClfOnly["Локальный криминалист (64 автора, офлайн)"]
-    Branch -->|"POST /ask"| Stage1["Шаг 1: Локальный криминалист"]
-    Stage1 --> Prompt["Системный промпт под автора"]
-    Prompt --> Stage2["Шаг 2: Облачный стилизатор (LLM API)"]
-    Stage2 --> AskRes["Автор + уверенность + текст в его стиле"]
-    Branch -->|"POST /agent или CLI"| Agent["ИИ-агент (Native / JSON / LangGraph)"]
-    Agent --> Tools["Инструменты: classify_style, author_metrics, calc"]
+    Branch -->|"POST /ask"| Stage1["Шаг 1: ML-фильтр жанра и стиля"]
+    Stage1 --> Stage2["Шаг 2: Семантический поиск RuBERT + FAISS"]
+    Stage2 --> Gateway["Динамический шлюз к любой LLM по API"]
+    Gateway --> AskRes["Точный ответ по выписке + источники + жанр + стиль"]
+    Branch -->|"POST /agent или ui.py"| Agent["ИИ-агенты (Native / JSON / LangGraph / Аналитик / Критик)"]
+    Agent --> Tools["Инструменты: classify_style, search_plots, author_metrics, calc"]
     Tools --> AgentRes["Итоговый ответ + трассировка шагов"]
 ```
 
@@ -101,15 +101,17 @@ flowchart LR
 
 | Папка / файл | Что там лежит простыми словами | Нужна ли для запуска сервера? |
 | :--- | :--- | :--- |
-| `src/` | **Боевой код проекта:** FastAPI (`app.py`), предобработка (`preprocessing.py`), классификаторы (`classifier.py`), клиент LLM (`llm_client.py`), конфиг (`config.py`), схемы (`schemas.py`), 3 ИИ-агента (`agents.py`) и MLOps (`train_mlflow.py`). | **Да, обязательно** |
+| `src/` | **Боевой код проекта:** FastAPI (`app.py`), семантический RAG (`rag.py`), предобработка и сетевой иммунитет (`preprocessing.py`), классификаторы (`classifier.py`), шлюз LLM (`llm_client.py`), конфиг (`config.py`), схемы (`schemas.py`), 4-инструментные агенты (`agents.py`) и MLOps (`train_mlflow.py`). | **Да, обязательно** |
+| `data/plots_dataset.csv` | **Подготовленный датасет сюжетов (132 произведения по всем 64 авторам)** для семантического RAG-поиска и аналитики. | **Да, обязательно** |
+| `ui.py` и `test_request.py` | **Веб-интерфейс Streamlit** (режимы RAG, Аналитик, Критик) и изолированный тестовый клиент для консоли. | Опционально (для UI/тестов) |
 | `agents_comparison.py` | **Скрипт сравнения 3 агентных циклов** в терминале (поддерживает живой и `--mock` режим, а также `--trace` в MLflow). | Нет (запускается для демонстрации) |
 | `.github/workflows/ci.yml` | **Конвейер CI в GitHub Actions:** автоматически запускает `ruff` и `pytest` при каждом `push` / `pull_request` в `main`. | Нет (работает на GitHub) |
 | `models/` | **Обученные веса моделей:** `tfidf_vectorizer.pkl`, `label_encoder.pkl`, `baseline_pytorch.pt` и `lora_classifier/`. | **Да, обязательно** |
-| `.env` | **Секретный файл с ключом `LLM_API_KEY`.** Исключён из Git и Docker. | **Да** (для `/ask` и живого `/agent`) |
+| `.env` | **Секретный файл с ключом `LLM_API_KEY` (любой модели по API).** Исключён из Git и Docker. | **Да** (для `/ask` и живого `/agent`) |
 | `notebooks/` | **Исследовательская лаборатория (4 ноутбука Jupyter):** очистка датасета, эксперименты TF-IDF, обучение Baseline и LoRA. | Нет (для изучения / переобучения) |
-| `data/` | **Книжный архив** (`raw/` и `processed/` с Parquet-файлами). Исключён из Git и Docker. | Нет (только для ноутбуков и обучения на полных данных) |
+| `data/raw` и `data/processed` | **Сырые и обработанные Parquet-файлы** (исключены из Git и Docker). | Нет (только для ноутбуков) |
 | `reports/` | **Метрики и графики обучения:** JSON/CSV-отчёты по моделям и авторам (используются в том числе инструментом `author_metrics`). | **Да** (для инструмента `author_metrics`) |
-| `tests/` | **Автоматические тесты (7 модулей, 38 тестов):** проверка предобработки, конфига и LLM, классификаторов, стресс-устойчивости, 3 агентов, MLflow Registry и FastAPI E2E. | Нет (для самопроверки) |
+| `tests/` | **Автоматические тесты (8 модулей, 44 теста):** проверка предобработки, RAG, динамического шлюза LLM, классификаторов, стресс-устойчивости, агентов, MLflow Registry и FastAPI E2E. | Нет (для самопроверки) |
 | `docs/` и `REPORT.md` | **Документация и аналитический отчёт.** | Нет |
 | `Dockerfile` | **Сборка изолированного Docker-контейнера** на CPU PyTorch с предзагруженным `ruBert-base`. | Только при запуске в Docker |
 
@@ -148,18 +150,22 @@ python -m venv .venv
 
 ---
 
-### Шаг 2. Настройка API-ключа внешней LLM (`.env`)
+### Шаг 2. Настройка API-ключа любой LLM (`.env`)
 
-Для генерации текста в `/ask` и живого режима агентов нужен ключ одного из трёх OpenAI-совместимых провайдеров (сервис определяет провайдера сам по префиксу ключа при `LLM_PROVIDER=auto`):
+Для генерации ответов в `/ask` и живого режима агентов подходит **любая модель по API**: достаточно указать ключ провайдера (сервис определяет провайдера по префиксу при `LLM_PROVIDER=auto`, либо поддерживает явные `LLM_BASE_URL` и `LLM_MODEL`):
 
-1. **Google AI Studio** — `AQ....` или `AIza...` (https://aistudio.google.com/apikey) → `gemini-3.1-flash-lite` + резервные модели `gemini-flash-lite-latest`, `gemma-4-31b-it`.
-2. **Groq Cloud** — `gsk_...` (https://console.groq.com/keys) → `llama-3.1-8b-instant`.
-3. **OpenRouter** — `sk-or-...` (https://openrouter.ai/keys) → `meta-llama/llama-3.3-70b-instruct:free`.
+1. **Google AI Studio** — `AQ....` или `AIza...` (или `GEMINI_API_KEY`) → автопоиск моделей Gemini.
+2. **Groq Cloud** — `gsk_...` (или `GROQ_API_KEY`) → `llama-3.1-8b-instant` / доступные модели тарифа.
+3. **OpenRouter** — `sk-or-...` (или `OPENROUTER_API_KEY`) → любые облачные/бесплатные модели.
+4. **OpenAI / DeepSeek / Ollama / vLLM** — `sk-...` (или `OPENAI_API_KEY` + опционально `LLM_BASE_URL` и `LLM_MODEL`).
+5. **Sber GigaChat** — `GIGACHAT_CREDENTIALS` (с автообменом OAuth и изоляцией прокси Windows).
 
 Скопируйте шаблон [.env.example](../.env.example) в файл `.env` и впишите свой ключ:
 ```ini
 LLM_API_KEY=ваш_ключ_без_кавычек
 LLM_PROVIDER=auto
+LLM_AUTO_DISCOVER_MODELS=true
+BYPASS_SYSTEM_PROXY=true
 CLASSIFIER_BACKEND=lora
 DEVICE=auto
 ```
@@ -303,12 +309,12 @@ python agents_comparison.py --query "Определи стиль отрывка 
 
 ```bash
 # Линтер Ruff (так же запускается в GitHub Actions CI):
-ruff check src tests agents_comparison.py --line-length 105
+ruff check src tests agents_comparison.py ui.py test_request.py --line-length 105
 
 # Автономные тесты без внешнего API-ключа и без тяжёлой загрузки LoRA:
 CLASSIFIER_BACKEND=baseline pytest tests -v --cov=src --cov-report=term-missing -k "not test_live_e2e and not test_baseline_and_lora"
 
-# Полный прогон всех 38 тестов (потребуется ключ в .env для live E2E и модель ruBERT для LoRA-теста):
+# Полный прогон всех 44 тестов (потребуется ключ в .env для live E2E и модель ruBERT для LoRA-теста):
 pytest tests -v --cov=src --cov-report=term-missing
 ```
 

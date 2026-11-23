@@ -74,8 +74,20 @@ class FastAPIIntegrationTests(unittest.TestCase):
                 "/ask", json={"question": "Какая прекрасная ночь над Невой...", "temperature": 0.6}
             )
             self.assertEqual(r_ask.status_code, 200)
-            self.assertEqual(r_ask.json()["predicted_author"], "Достоевский Ф")
-            self.assertIn("Невой", r_ask.json()["generated_text"])
+            self.assertIn("charset=utf-8", r_ask.headers["content-type"].lower())
+            body_ask = r_ask.json()
+            self.assertEqual(body_ask["predicted_author"], "Достоевский Ф")
+            self.assertIn("Невой", body_ask["generated_text"])
+            self.assertEqual(body_ask["answer"], body_ask["generated_text"])
+            self.assertTrue(body_ask["predicted_genre"])
+            self.assertGreaterEqual(len(body_ask["sources"]), 1)
+
+            r_mars = client.post(
+                "/ask",
+                json={"question": "Найди сюжет про космическую экспедицию к Марсу", "k": 2},
+            )
+            self.assertEqual(r_mars.status_code, 200)
+            self.assertTrue(any("Аэлита" in s for s in r_mars.json()["sources"]))
 
             # 5. Проброс ошибки внешнего LLM API (504)
             mock_llm.generate.side_effect = LLMError("Тайм-аут провайдера", status_code=504)

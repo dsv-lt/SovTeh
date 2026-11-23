@@ -1,15 +1,73 @@
-"""Общие функции предобработки текста.
+"""Общие функции предобработки текста, кросс-платформенного кодирования и сетевой изоляции.
 
 Модуль используется и в исследовательских ноутбуках, и в продакшен-сервисе,
-что гарантирует идентичную обработку текста при обучении и инференсе.
+что гарантирует идентичную обработку текста при обучении и инференсе,
+корректную работу с UTF-8 / CP1251 (включая Windows PowerShell) и защиту
+процесса Python от прокси-перехватчиков Windows.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from collections.abc import Iterable
 from pathlib import Path
+
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
+
+_NO_PROXY_HOSTS = (
+    "localhost,127.0.0.1,0.0.0.0,"
+    "generativelanguage.googleapis.com,api.groq.com,openrouter.ai,"
+    "api.openai.com,api.gigachat.ru,gigachat.devices.sberbank.ru,ngw.devices.sberbank.ru"
+)
+
+
+def enforce_network_immunity() -> dict[str, str]:
+    """Жёсткая изоляция процесса Python от системных прокси, VPN и перехватчиков Windows."""
+    for key in _PROXY_ENV_KEYS:
+        os.environ[key] = ""
+    os.environ["NO_PROXY"] = _NO_PROXY_HOSTS
+    os.environ["no_proxy"] = _NO_PROXY_HOSTS
+    os.environ["GIGACHAT_DISABLE_SSL"] = "True"
+    return {
+        "NO_PROXY": os.environ["NO_PROXY"],
+        "GIGACHAT_DISABLE_SSL": os.environ["GIGACHAT_DISABLE_SSL"],
+    }
+
+
+def configure_cross_platform_stdio() -> None:
+    """Настраивает stdout/stderr на UTF-8 для бесшовного вывода кириллицы в Windows PowerShell."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+def decode_bytes_cross_platform(raw: bytes) -> str:
+    """Декодирует байты, последовательно проверяя UTF-8 (с BOM и без) и Windows-1251."""
+    for enc in ("utf-8-sig", "utf-8", "cp1251"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def read_text_cross_platform(path: str | Path) -> str:
+    """Кросс-платформенно читает файл в кодировке UTF-8 или CP1251."""
+    return decode_bytes_cross_platform(Path(path).read_bytes())
 
 # Основное регулярное выражение из ТЗ («Напиши текс в стиле автора Платонов С»).
 # Запрет перевода строк исключает многострочные инъекции команд через имя автора.

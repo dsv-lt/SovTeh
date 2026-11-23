@@ -21,14 +21,20 @@ SovTeh/
 │
 ├── src/                                  # БОЕВОЙ КОД МИКРОСЕРВИСА, MLOps И ИИ-АГЕНТОВ
 │   ├── __init__.py                       # Маркер Python-пакета src
-│   ├── preprocessing.py                  # Очистка, нормализация, парсинг авторов и нарезка на чанки
-│   ├── config.py                         # Чтение настроек из .env/окружения и автовыбор LLM-провайдера
+│   ├── preprocessing.py                  # Очистка, нарезка, UTF-8/CP1251, сетевой иммунитет
+│   ├── config.py                         # Настройки, автоопределение любых LLM-провайдеров и RAG
 │   ├── schemas.py                        # Pydantic-контракты для /health, /classify, /ask и /agent
 │   ├── classifier.py                     # Нейросетевые классификаторы стиля (Baseline MLP и ruBERT+LoRA)
-│   ├── llm_client.py                     # Асинхронный HTTP-клиент к облачным LLM (chat + tool_calls + generate)
+│   ├── llm_client.py                     # Универсальный динамический шлюз LLM (GET /models, trust_env=False)
+│   ├── rag.py                            # Ядро RAG: Hashing+SGD фильтр, RuBERT+FAISS, Аналитик и Критик
 │   ├── train_mlflow.py                   # MLOps: эксперименты в MLflow, артефакты и Model Registry (Staging)
-│   ├── agents.py                         # 3 инструмента, run_tool, Native / JSON / LangGraph агенты + MLflow Tracing
+│   ├── agents.py                         # 4 инструмента, run_tool, Native / JSON / LangGraph агенты + MLflow Tracing
 │   └── app.py                            # Точка входа FastAPI: lifespan, /, /health, /classify, /ask, /agent
+│
+├── ui.py                                 # Мультиагентный веб-интерфейс Streamlit (RAG, Аналитик, Критик)
+├── test_request.py                       # Изолированный тестовый HTTP-клиент с обходом прокси Windows
+├── data/
+│   └── plots_dataset.csv                 # Подготовленный датасет сюжетов (132 записи, все 64 автора)
 │
 ├── models/                               # ОБУЧЕННЫЕ АРТЕФАКТЫ МОДЕЛЕЙ (загружаются при старте)
 │   ├── tfidf_vectorizer.pkl              # Посимвольный TF-IDF векторизатор (char 2..4, 50 000 признаков)
@@ -52,14 +58,15 @@ SovTeh/
 │   ├── raw/                              # Сырые train_dataset.json, validation_dataset.json, test_dataset.json
 │   └── processed/                        # Очищенные документы (parsed_*.parquet) и чанки (chunks_*.parquet)
 │
-├── tests/                                # АВТОМАТИЧЕСКИЕ ТЕСТЫ (7 модулей, 38 тестов)
+├── tests/                                # АВТОМАТИЧЕСКИЕ ТЕСТЫ (8 модулей, 44 теста)
 │   ├── __init__.py                       # Описание тестового пакета
 │   ├── test_preprocessing.py             # Юнит-тесты очистки, парсинга 4 шаблонов и нарезки на чанки
-│   ├── test_config_and_llm.py            # Юнит-тесты Settings, автовыбора провайдера, ретраев и ошибок LLM
+│   ├── test_config_and_llm.py            # Юнит-тесты Settings, автопоиска моделей, ретраев и сетевой изоляции
 │   ├── test_classifiers.py               # Целостность весов в models/ и инференс Baseline / LoRA
 │   ├── test_adversarial_and_robustness.py# Стресс-тесты: невидимые/управляющие байты, инъекции, DoS, OOD
-│   ├── test_agents.py                    # Юнит- и интеграционные тесты инструментов, 3 агентов и POST /agent
+│   ├── test_agents.py                    # Юнит- и интеграционные тесты 4 инструментов, 3 агентов и POST /agent
 │   ├── test_mlflow.py                    # Интеграционный тест MLflow-экспериментов, артефактов и Staging
+│   ├── test_rag.py                       # Тесты RAG (Hashing+SGD, FAISSVectorIndex, CP1251, Аналитик/Критик)
 │   └── test_api_and_e2e.py               # Интеграционные тесты FastAPI + живой E2E-тест с облачной LLM
 │
 ├── reports/                              # МЕТРИКИ, ОТЧЁТЫ И ГРАФИКИ (также читаются tool_author_metrics)
@@ -197,20 +204,16 @@ flowchart LR
 ### 3.3. Пошаговая трассировка `POST /ask` и `POST /agent`
 
 #### Поток `POST /ask`
-1. FastAPI валидирует тело по [`QueryRequest`](../src/schemas.py#L8-L16). На `""` [`validation_exception_handler()`](../src/app.py#L104-L115) возвращает `400 {"detail": "Пустой вопрос"}`.
-2. [`ask()`](../src/app.py#L156-L187) очищает ввод через `normalize_for_model(payload.question)` (удаляя невидимые символы, отсекая пробельные/контрольные строки кодом `400`).
-3. Через `asyncio.to_thread(classifier.predict, cleaned, payload.k)` запускается [`StyleClassifier.predict()`](../src/classifier.py#L71-L81): нарезка `chunk_text()`, расчёт `_logits()`, усреднение `softmax` по фрагментам.
-4. `build_system_prompt(pred.author)` подставляет найденного автора и инструкции защиты от prompt-инъекций.
-5. [`LLMClient.generate()`](../src/llm_client.py#L207-L218) вызывает `self.chat(...)` → `_request_completion(...)` с ретраями и fallback-моделями и возвращает [`QueryResponse`](../src/schemas.py#L24-L28).
+1. FastAPI валидирует тело по `QueryRequest`. На пустую строку возвращается `400 {"detail": "Пустой вопрос"}`.
+2. `ask()` очищает ввод через `normalize_for_model(payload.question)`.
+3. Через `asyncio.to_thread(classifier.predict, ...)` определяется ближайший авторский стиль (`64` класса).
+4. Через `asyncio.to_thread(rag_search, ...)` выполняется двухэтапный RAG-поиск: локальный ML-фильтр жанров (`HashingVectorizer + SGDClassifier`) и семантическое ранжирование (`FAISSVectorIndex` с поддержкой RuBERT/FAISS/CUDA GPU) по `data/plots_dataset.csv`.
+5. `build_rag_system_prompt()` формирует системный промпт строгого аналитика с защитой от галлюцинаций и инъекций; `LLMClient.generate()` отправляет запрос к активной модели (с динамическим автопоиском через `GET /models`, изоляцией прокси `trust_env=False` и ретраями) и возвращает `QueryResponse` (`answer`, `sources`, `predicted_author`, `predicted_genre`, `confidence`, `model_name`, `generated_text`).
 
 #### Поток `POST /agent`
-1. [`agent_endpoint()`](../src/app.py#L190-L232) проверяет тело по [`AgentRequest`](../src/schemas.py#L43-L56) (`approach`: `native | json | framework`, `max_iterations`: `1..12`), очищает вопрос через `normalize_for_model()` и убеждается, что `set_agent_classifier(classifier)` указывает на загруженную модель.
-2. По значению `payload.approach` вызывается одна из трёх корутин:
-   * `native` → [`run_native_agent_async()`](../src/agents.py#L401-L494) (цикл с `TOOL_SCHEMAS`, `tool_calls` и `role="tool"`);
-   * `json` → [`run_json_agent_async()`](../src/agents.py#L522-L617) (строгий JSON + [`extract_json()`](../src/agents.py#L322-L332));
-   * `framework` → [`run_framework_agent_async()`](../src/agents.py#L705-L752) (`langgraph.prebuilt.create_react_agent` + `@tool`-обёртки).
-3. Все вызовы инструментов проходят через единую безопасную обёртку [`run_tool()`](../src/agents.py#L298-L319) (Pydantic-валидация + изоляция исключений) и записываются в `AgentStepTrace`.
-4. Результат возвращается клиенту в формате [`AgentResponse`](../src/schemas.py#L67-L71).
+1. `agent_endpoint()` проверяет тело по `AgentRequest` (`approach`: `native | json | framework`, `mode`: опциональный режим Streamlit UI `"Аналитик"` / `"Критик"` / `"RAG"`).
+2. При заданном `mode` запускаются `run_analyst_agent_async()`, `run_critic_agent_async()` или `rag_answer_async()` из `src/rag.py`.
+3. При стандартном вызове по `approach` запускается один из 3 агентных циклов (`run_native_agent_async`, `run_json_agent_async`, `run_framework_agent_async`) с 4 инструментами (`classify_style`, `search_plots`, `author_metrics`, `calc`).
 
 ---
 
