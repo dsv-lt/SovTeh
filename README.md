@@ -76,7 +76,7 @@ SovTeh/
 ├── notebooks/                       # 4 исследовательских ноутбука (01_eda..04_lora_finetuning)
 ├── reports/                         # Метрики (metrics_*.json, lora_per_class_report.csv) и графики (figures/)
 ├── tests/                           # 8 модулей автотестов (44 сценария)
-├── docs/                            # USER_GUIDE.md, CODEBASE_ARCHITECTURE.md, TECHNICAL_DOCUMENTATION.md
+├── docs/                            # USER_GUIDE.md, SWAGGER_DOCS_GUIDE.md, CODEBASE_ARCHITECTURE.md, TECHNICAL_DOCUMENTATION.md
 ├── Dockerfile                       # Сборка изолированного CPU-контейнера с RuBERT и data/plots_dataset.csv
 ├── requirements.txt                 # Зависимости проекта
 ├── .env.example                     # Шаблон настроек для любой модели по API
@@ -182,5 +182,6 @@ docker run --rm -p 8000:8000 -e LLM_API_KEY="Ваш_API_Ключ_LLM" sovteh-rag
 Дополнительные материалы в репозитории:
 * [REPORT.md](REPORT.md) — аналитический отчёт по экспериментам, метрикам, RAG и покрытию тестами.
 * [docs/USER_GUIDE.md](docs/USER_GUIDE.md) — простое объяснение проекта и подробное руководство пользователя.
+* [docs/SWAGGER_DOCS_GUIDE.md](docs/SWAGGER_DOCS_GUIDE.md) — полная пошаговая инструкция по каждому действию в Swagger UI (`http://localhost:8000/docs`).
 * [docs/CODEBASE_ARCHITECTURE.md](docs/CODEBASE_ARCHITECTURE.md) — карта кода с разбором каждого модуля.
 * [docs/TECHNICAL_DOCUMENTATION.md](docs/TECHNICAL_DOCUMENTATION.md) — инженерная спецификация API, RAG, шлюза LLM, MLOps и агентов.
